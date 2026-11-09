@@ -1,0 +1,32 @@
+# jiro-core and jiro-shell; the native module built on them for the wedgie's Cortex-M0,
+# wedgie/natmod/rust, whose own .cargo/config.toml sets that target when Cargo runs there; and the
+# replay command that the play test checks the app's journals with. A plain `cargo test` here
+# builds the three host crates.
+[workspace]
+resolver = "3"
+members = ["core", "shell", "tools", "wedgie/natmod/rust"]
+default-members = ["core", "shell", "tools"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[profile.dev]
+overflow-checks = true
+
+[profile.test]
+overflow-checks = true
+
+[profile.bench]
+overflow-checks = true
+
+# opt-level "s": the module's code is loaded into the wedgie's RAM (wedgie/README.md, Size).
+[profile.release]
+overflow-checks = true
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = "s"

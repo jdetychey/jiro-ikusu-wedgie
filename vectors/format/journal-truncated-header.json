@@ -1,0 +1,6 @@
+{
+  "kind": "journal",
+  "name": "truncated-header",
+  "input": "0x01000200277b9e3cebd776c6d46a8b4eb9b83ac165961f4b46a79baef5df1514bb5219cd04e24fd698778a8dbcf62ab0c9ed0228d67be3ddd3aeb682f4a67a53410dacc90000",
+  "error": 1
+}

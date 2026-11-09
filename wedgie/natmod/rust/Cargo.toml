@@ -1,0 +1,20 @@
+[package]
+name = "jiro-natmod"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# A member of the root workspace, so that Cargo hashes jiro-core's and jiro-shell's paths relative
+# to it: the module's bytes then do not depend on where the repository is checked out. Built for
+# the wedgie only, by wedgie/scripts/build-core.sh: no test harness on the host.
+[lib]
+crate-type = ["staticlib"]
+test = false
+doctest = false
+
+[dependencies]
+jiro-core = { path = "../../../core" }
+jiro-shell = { path = "../../../shell" }
+# The trace keccak uses the core's own keccak crate, at the version of the root Cargo.lock.
+tiny-keccak = { version = "=2.0.2", features = ["keccak"] }
