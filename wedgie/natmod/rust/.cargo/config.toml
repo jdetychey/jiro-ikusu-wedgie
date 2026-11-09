@@ -1,0 +1,7 @@
+[build]
+target = "thumbv6m-none-eabi"
+
+# mpy_ld links position-independent code only: text and rodata reached PC-relative or through
+# the GOT, pointers in .data.rel.ro patched at import.
+[target.thumbv6m-none-eabi]
+rustflags = ["-C", "relocation-model=pic", "-C", "force-unwind-tables=no"]

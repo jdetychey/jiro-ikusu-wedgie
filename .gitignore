@@ -1,0 +1,8 @@
+target/
+__pycache__/
+# Build outputs; the app's own files in wedgie/app/ are committed: they are what a wedgie installs.
+wedgie/natmod/glue/build/
+wedgie/natmod/glue/jiro_core.mpy
+wedgie/check/jiro_check.mpy
+wedgie/check/jiro_core.mpy
+wedgie/check/jiro_vectors.bin

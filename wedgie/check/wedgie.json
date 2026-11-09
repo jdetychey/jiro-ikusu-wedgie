@@ -1,0 +1,13 @@
+{
+  "apps": [
+    {
+      "mod": "jiro",
+      "name": "Jiro Check",
+      "about": "Replays every Jiro-ikusu golden vector through the Rust game core and checks it bit for bit.",
+      "files": ["jiro.py", "jiro_check.mpy", "jiro_core.mpy", "jiro_vectors.bin"],
+      "entry": "run",
+      "fw": "0.3.36",
+      "label": "#2850ff"
+    }
+  ]
+}
