@@ -338,10 +338,12 @@ class Training:
 
     def render(self):
         """Erases the entities where they stood, paints the cells that changed, draws the
-        entities, and pushes only the regions that changed: the cells each entity left and
-        entered, the player's with its ring. One call with few locals, since a call whose frame
-        is over 11 words takes it from the heap, a first-fit search that a fragmented heap makes
-        slow, and slower the larger the frame (wedgie/scripts/check_app_frames.py)."""
+        entities, then pushes only the regions that changed: the changed cells, and the cells each
+        entity left and entered, the player's with its ring. Nothing is pushed before everything
+        is drawn, so the screen never shows a capture's cells without the entities on them. One
+        call with few locals, since a call whose frame is over 11 words takes it from the heap, a
+        first-fit search that a fragmented heap makes slow, and slower the larger the frame
+        (wedgie/scripts/check_app_frames.py)."""
         # The array of the render before last takes this tick's status.
         status, previous = self.previous, self.status
         self.status, self.previous = status, previous
@@ -355,12 +357,8 @@ class Training:
             if previous[slot] == _LIVE:
                 jc.restore(recorder, frame, CELL_COLORS, previous[slot + 1], previous[slot + 2], 1, 1)
         jc.restore(recorder, frame, CELL_COLORS, max(previous[_PLAYER_X] - 1, 0), max(previous[_PLAYER_Y] - 1, 0), 3, 3)
-        # The cells that changed since the last render, pushed as one rectangle or band of rows.
-        if jc.paint(recorder, self.shadow, frame, CELL_COLORS, self.rect):
-            if self.rect[2] >= _BAND_MIN_PX:
-                self.show_band(self.rect[1], self.rect[1] + self.rect[3])
-            else:
-                show(self.rect[0], self.rect[1], self.rect[2], self.rect[3])
+        # The cells that changed since the last render; their rectangle goes to self.rect.
+        jc.paint(recorder, self.shadow, frame, CELL_COLORS, self.rect)
         # The entities where they are now, the player on top.
         fill(status[_BOSS_X] * _CELL_PX, status[_BOSS_Y] * _CELL_PX, status[_BOSS_SIZE] * _CELL_PX, status[_BOSS_SIZE] * _CELL_PX, BOSS)
         for slot in range(_MINIONS, _STATUS_LEN, _MINION_FIELDS):
@@ -369,6 +367,11 @@ class Training:
         x, y = status[_PLAYER_X] * _CELL_PX, status[_PLAYER_Y] * _CELL_PX  # fill_rect clips the ring to the screen
         fill(x - _PLAYER_MARGIN_PX, y - _PLAYER_MARGIN_PX, _RING_PX, _RING_PX, PLAYER_RING)
         fill(x - 1, y - 1, _RING_PX - 2, _RING_PX - 2, PLAYER_PROTECTED if status[_INVULNERABLE] else PLAYER)
+        # The changed cells' rectangle, if any cell changed: its rows at full width when it is wide.
+        if self.rect[2] >= _BAND_MIN_PX:
+            self.show_band(self.rect[1], self.rect[1] + self.rect[3])
+        elif self.rect[2]:
+            show(self.rect[0], self.rect[1], self.rect[2], self.rect[3])
         # One push per entity: the rectangle that holds where it stood and where it is.
         x, y = min(previous[_BOSS_X], status[_BOSS_X]), min(previous[_BOSS_Y], status[_BOSS_Y])
         show(x * _CELL_PX, y * _CELL_PX, (max(previous[_BOSS_X], status[_BOSS_X]) + status[_BOSS_SIZE] - x) * _CELL_PX,

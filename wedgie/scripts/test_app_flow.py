@@ -66,12 +66,14 @@ class Wedgie:
     buffers. `outcomes` scripts the levels played, in order: (ticks, end reason, claim in basis
     points, lives left); `presses` the keys pressed on the screens outside play, in order, each a
     second after its screen. The run ends with Done once they are all made. `stalls` gives the
-    ticks whose step takes that many µs."""
+    ticks whose step takes that many µs, `changed` the pixel rectangle of the cells that every
+    paint finds changed."""
 
-    def __init__(self, outcomes=(), presses=(), bests=None, store_errors=(), status=None, stalls=None):
+    def __init__(self, outcomes=(), presses=(), bests=None, store_errors=(), status=None, stalls=None, changed=None):
         self.outcomes, self.presses, self.store_errors = list(outcomes), list(presses), list(store_errors)
         self.bests = {} if bests is None else bests
         self.entities, self.stalls, self.stepped_at = status or {}, stalls or {}, []
+        self.changed, self.drawing = changed, []  # the fills and pushes, in order, a list per render
         self.clock = Clock()
         self.pages, self.colors, self.overlays, self.stores, self.stages, self.pushes = [], [], [], [], [], []
         self.playing = None  # the level in play: its bytes, its outcome and the ticks stepped
@@ -97,7 +99,7 @@ class Wedgie:
                 wedgie.push(x, y, w, h)
 
             def fill_rect(self, x, y, w, h, color):
-                pass
+                wedgie.drawing[-1].append(("fill", x, y, w, h))
 
             def center_text(self, text, y, color, scale=1):
                 wedgie.overlays.append(text)
@@ -123,7 +125,7 @@ class Wedgie:
             "jiro_core": types.SimpleNamespace(
                 rules_version=lambda: CALIBRATION["rulesVersion"], recorder_size=lambda: 64, start=self.start,
                 step=self.step, status=self.status, score=self.score, journal=self.journal,
-                paint=lambda recorder, shadow, frame, colors, rect, full=False: 0,
+                paint=self.paint,
                 restore=lambda recorder, frame, colors, x, y, width, height: None),
         }
 
@@ -171,6 +173,8 @@ class Wedgie:
         if not (0 <= x and 0 <= y and w > 0 and h > 0 and x + w <= 240 and y + h <= 240):
             raise AssertionError(f"a push off the screen: {(x, y, w, h)}")
         self.pushes.append((x, y, w, h))
+        if self.drawing:
+            self.drawing[-1].append(("push", x, y, w, h))
 
     def store(self, name, value):
         if self.stack_slot[0] is not None:
@@ -197,7 +201,12 @@ class Wedgie:
         self.ended, self.playing = self.playing, None
         return end
 
+    def paint(self, recorder, shadow, frame, colors, rect, full=False):
+        rect[:] = type(rect)(rect.typecode, self.changed or (0, 0, 0, 0))
+        return 1 if self.changed else 0
+
     def status(self, recorder, out):
+        self.drawing.append([])
         level, (_, end, claim, lives), ticks = self.playing or self.ended
         fields = {END: 0 if self.playing else end, TICKS: ticks, LIVES: lives if not self.playing else level[-3],
                   TIME_LIMIT: int.from_bytes(level[-5:-3], "big"), CLAIM: 0 if self.playing else claim,
@@ -360,6 +369,23 @@ class Flow(unittest.TestCase):
                     wedgie = self.play(outcomes=[(3, COMMITTED, 0, 5)], presses=["A", "A"], status=entities)
                     # Each render pushes the boss, the two live minions and the player.
                     self.assertEqual(len([push for push in wedgie.pushes if push[2:] != (240, 240)]) % 4, 0)
+
+    def test_a_tick_draws_everything_before_it_pushes_anything(self):
+        # Changed cells 16 pixels wide go out as their rectangle, 128 wide as their rows at full width.
+        for changed, pushed in (((40, 80, 16, 24), (40, 80, 16, 24)), ((40, 80, 128, 24), (0, 80, 240, 24))):
+            with self.subTest(changed=changed):
+                wedgie = self.play(outcomes=[(3, COMMITTED, 0, 5)], presses=["A", "A"], changed=changed)
+                renders = [drawn for drawn in wedgie.drawing if drawn]
+                self.assertEqual(len(renders), 2 + 3, "the two redraws of a level start, then a render a tick")
+                for drawn in renders[2:]:
+                    # The boss, the player's ring and the player; then the changed cells, the boss and the player.
+                    self.assertEqual([kind for kind, *_ in drawn], ["fill"] * 3 + ["push"] * 3)
+                    self.assertEqual(drawn[3], ("push", *pushed))
+
+    def test_a_tick_that_changed_no_cell_pushes_the_entities_alone(self):
+        wedgie = self.play(outcomes=[(3, COMMITTED, 0, 5)], presses=["A", "A"])
+        for drawn in [drawn for drawn in wedgie.drawing if drawn][2:]:
+            self.assertEqual([kind for kind, *_ in drawn], ["fill"] * 3 + ["push"] * 2, "the boss, then the player")
 
     def test_the_core_refusing_a_step_or_a_level_raises(self):
         with self.assertRaisesRegex(RuntimeError, "jiro-core error 15 on tick 2"):
