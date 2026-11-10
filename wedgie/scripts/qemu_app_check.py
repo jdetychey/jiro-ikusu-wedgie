@@ -30,7 +30,18 @@ the remaining ticks must run at once, late, instead of sleeping for minutes. The
 - the best scores it stored, the free heap and largest free block it printed at each stage, a
   summary screen per level, the first saying its best was not saved, and no overrun before the
   clock's jump and one on every tick from it on;
-- that the heap was locked over every tick's sample, step and render.
+- that the heap was locked over every tick's sample, step and render;
+- that the ballast left the free bytes asked for.
+
+With --screen it also keeps a copy of the screen as the app's pushes leave it (show copies its
+rows into it, show_rect its rectangle), and after every tick's render checks that the app pushed
+every pixel it drew, then calls the app's own full redraw and checks that it draws that same
+picture: a cell or an entity that the tick's partial drawing left stale, in the framebuffer or
+on the screen, fails the test. The copy takes 28,800 bytes of the port's heap, above the app's
+files, and its code some room beside the stubs, so the heap holds less than a wedgie's 137,760
+free bytes with it, and what it holds is in more pieces: run it with fewer free bytes, such as
+the 113,568 a power-up with the WEDGIE drive leaves. Its checks run inside the app's ticks, so
+the times it prints are not the app's.
 
 With --hard-irq, on the firmware `build-qemu.sh irqsim` builds, every tick of the port's SysTick,
 from before the ballast on, also calls a Python callback as a hard IRQ, as the wedgie firmware's
@@ -43,15 +54,17 @@ runs with -icount shift=3, 8 ns of virtual time per instruction, and the port's 
 25 MHz SysTick that qemu's nRF51 clocks at 16 MHz, so one microsecond the app measures is
 1,562.5 / 8 = 195.3 instructions (measured with an inline-assembler loop of known length).
 
-Usage: python3 -I qemu_app_check.py <firmware.elf> <app dir> <free bytes> [<holes>] [--hard-irq]
+Usage: python3 -I qemu_app_check.py <firmware.elf> <app dir> <free bytes> [<holes>] [--hard-irq] [--screen]
 
 <holes> is the number of small holes among the free bytes, HOLES by default; 0 leaves them all in
 the large block.
 
-Run it under a timeout: a module that hard-faults hangs qemu. Exit status 0 when every check
-passes.
+Run it under a timeout: a module that hard-faults hangs qemu. Run one at a time: while the app
+sleeps, qemu's clock follows the host's, so on a starved host a tick can read as an overrun. Exit
+status 0 when every check passes.
 """
 
+import argparse
 import ast
 import base64
 import importlib.util
@@ -82,6 +95,9 @@ SQUEEZE_BYTES = 1024  # round E1's second build measured a largest free block of
 HOLE_SIZES = (64, 256, 448, 128, 320, 512, 192, 384)  # bytes, interleaved with 16-byte live blocks
 UPLOAD_ROOM = 32 * 1024  # what uploading the files needs beside them
 STUB_ROOM = 64 * 1024  # what importing the stubs needs, their 28,800-byte screen buffer included
+SCREEN_BYTES = 28800  # the 240 x 240 screen at 4 bits a pixel: --screen's copy of it
+SCREEN_ROOM = 8 * 1024  # what importing --screen's stub needs beside the others
+BALLAST_SLACK = 1024  # the ballast leaves the free bytes asked for, to within this many
 STAGES = ("run", "buf", "imp", "lcd", "app", "sel", "lvl")
 WRAP_AFTER_US = 1_500_000  # from the last press outside play, just before tick 0, to the clock's wrap: about tick 22
 LATE_TICK = 70
@@ -123,6 +139,8 @@ STUBS = {
     "lcd.py": """\
 import clock, framebuf, gc, micropython, sys
 from lcd_buffer import BUF as _BUF
+if SCREEN:
+  import screen
 _PALETTE = ((0, 0, 0), (255, 255, 255), (40, 100, 230), (255, 42, 42), (255, 220, 0), (60, 255, 120),
             (154, 154, 154), (34, 196, 82), (90, 90, 90))
 def color(r, g, b):
@@ -136,10 +154,14 @@ class LCD(framebuf.FrameBuffer):
     if not 0 <= y0 < y1 <= 240:
       raise ValueError('show off the screen: %r' % ((y0, y1),))
     _rows[0] += y1 - y0
+    if SCREEN:
+      screen.show(y0, y1)
   def show_rect(s, x, y, w, h):
     if not (0 <= x and 0 <= y and w > 0 and h > 0 and x + w <= 240 and y + h <= 240):
       raise ValueError('show_rect off the screen: %r' % ((x, y, w, h),))
     _rows[0] += h
+    if SCREEN:
+      screen.show_rect(x, y, w, h)
   def center_text(s, t, y, c, scale=1):
     s.text(t, (240 - 8 * len(t)) // 2, y, c)
 class ScriptDone(Exception):
@@ -184,6 +206,8 @@ def _lock_ticks():
   app, jc = sys.modules['jiro_app'], sys.modules['jiro_core']
   _inner['sample'], _inner['step'], _inner['render'] = app.sample, jc.step, app.Training.render
   app.sample, jc.step, app.Training.render = _sample, _step, _render
+  if SCREEN:
+    screen.watch(app.Training, _rows, _level, _tick)
 def _squeeze():
   for i in range(len(_held)):
     size = _largest()
@@ -203,7 +227,8 @@ class Keys:
       _level[0] += 1
       if _level[0] == PLAY_COUNT:
         raise ScriptDone('scripted inputs done; most rows pushed in a tick: %d; heap locked over %d samples, %d steps '
-                         'and %d renders' % (_rows[1], _locked[0], _locked[1], _locked[2]))
+                         'and %d renders' % (_rows[1], _locked[0], _locked[1], _locked[2])
+                         + (screen.result() if SCREEN else ''))
       _play[0], _tick[0] = False, 0
     if not _play[0]:
       if not _inner:
@@ -269,6 +294,74 @@ def urandom(n):
   return NONCE[:n]
 """,
 }
+
+# --screen's stub, which lcd.py's pushes and its wrapper of the app's render call. PANEL is the
+# glass: the framebuffer's bytes as the pushes left them, allocated with the files, above the
+# heap the app runs in. The copies and the comparison are native code, so that a push copies with
+# the heap locked, as a tick's pushes are. After a tick's render, _check counts the bytes the app
+# drew but did not push, then calls the app's full redraw, whose show() counts the bytes it draws
+# otherwise before it copies them. The redraw repaints every cell and the entities where they
+# are, so it leaves the app's state as the tick left it.
+SCREEN_STUB = """\
+import micropython
+from lcd_buffer import BUF as _BUF
+_seen, _checking, _redrawing, _inner, _lcd = [0, 0, 0, 0, -1], [False], [0], {}, []
+@micropython.viper
+def _copy(to: ptr8, source: ptr8, start: int, count: int):
+  end = start + count
+  while start < end:
+    to[start] = source[start]
+    start += 1
+@micropython.viper
+def _differing(a: ptr8, b: ptr8, count: int) -> int:
+  differing = 0
+  i = 0
+  while i < count:
+    if a[i] != b[i]:
+      differing += 1
+    i += 1
+  return differing
+def show(y0, y1):
+  if _checking[0]:
+    _seen[2] += _differing(PANEL, _BUF, len(_BUF))
+  _copy(PANEL, _BUF, y0 * 120, (y1 - y0) * 120)
+def show_rect(x, y, w, h):
+  if x & 1 or w & 1:
+    raise ValueError('show_rect splits a byte of two pixels, which the copy does not model: %r' % ((x, y, w, h),))
+  for row in range(y, y + h):
+    _copy(PANEL, _BUF, row * 120 + x // 2, w // 2)
+def _render(app, status, previous):
+  _inner['render'](app, status, previous)
+  if not _redrawing[0]:
+    _check(app)
+def _redraw(app):
+  _redrawing[0] += 1
+  try:
+    _inner['redraw'](app)
+  finally:
+    _redrawing[0] -= 1
+def _check(app):
+  rows, level, tick = _lcd
+  pushed, unlike = rows[0], _seen[2]
+  stale = _differing(PANEL, _BUF, len(_BUF))
+  _checking[0] = True
+  try:
+    app.redraw()
+  finally:
+    _checking[0] = False
+  rows[0] = pushed
+  _seen[0] += 1
+  _seen[1] += stale
+  if (stale or _seen[2] != unlike) and _seen[4] < 0:
+    _seen[3], _seen[4] = level[0] + 1, tick[0] - 1
+def watch(training, rows, level, tick):
+  _lcd.extend((rows, level, tick))
+  _inner['render'], _inner['redraw'] = training.render, training.redraw
+  training.render, training.redraw = _render, _redraw
+def result():
+  return ('; screen checked after %d renders: %d B not pushed, %d B unlike a full redraw, first on level %d tick %d'
+          % tuple(_seen))
+"""
 
 # A RAM filesystem over _FILES, with the seek the app's level reads need.
 VFS = """\
@@ -458,7 +551,39 @@ def check_level(repo, calibration, level, output, stored):
     return problems
 
 
-def check(out, err, repo, irq_counts):
+def check_ballast(ballast, settled, free_bytes):
+    """The problems of the heap the ballast left the app: it must have the free bytes asked for,
+    and still have them once the ballast's probe of the largest block is collected."""
+    left = re.search(r"heap free with ballast (\d+)", ballast)
+    if not left or abs(int(left[1]) - free_bytes) > BALLAST_SLACK:
+        return [f"the ballast left {left[1] if left else 'an unread number of'} bytes free, not the {free_bytes} asked "
+                "for: the port's heap does not hold them beside the test's files"]
+    if abs(int(settled) - int(left[1])) > BALLAST_SLACK:
+        return [f"{settled.strip()} bytes are free after the ballast, not the {left[1]} it left: its probe of the largest "
+                "block is still allocated"]
+    return []
+
+
+def check_screen(err, ticks):
+    """The problems of --screen's checks: after every tick's render, the screen showed what the app
+    had drawn, which was what its full redraw draws."""
+    seen = re.search(r"screen checked after (\d+) renders: (\d+) B not pushed, (\d+) B unlike a full redraw, "
+                     r"first on level (\d+) tick (-?\d+)", err)
+    if not seen:
+        return ["the screen checks were not read: the app did not end"]
+    checked, stale, unlike, level, tick = map(int, seen.groups())
+    print(f"screen: checked after {checked} renders, {stale} bytes drawn but not pushed, {unlike} bytes unlike a full "
+          "redraw")
+    problems = []
+    if checked != ticks:
+        problems.append(f"the screen was checked after {checked} renders, expected every one of the {ticks} ticks")
+    if stale or unlike:
+        problems.append(f"the screen did not show what a full redraw draws: {stale} bytes drawn but not pushed, {unlike} "
+                        f"bytes unlike a full redraw, over all ticks; first on level {level}, tick {tick}")
+    return problems
+
+
+def check(out, err, repo, irq_counts, screen):
     lines = out.splitlines()
     calibration = json.loads((repo / "seasons" / "calibration-1.json").read_text())
     problems = []
@@ -478,6 +603,8 @@ def check(out, err, repo, irq_counts):
     ticks = sum(fields(line, "ticks")[0] for line, _, _ in outputs)
     if not locked or not int(locked[1]) == int(locked[2]) == ticks <= int(locked[3]):
         problems.append(f"the heap was locked over {locked and locked[0]}, expected every one of the {ticks} ticks")
+    if screen:
+        problems += check_screen(err, ticks)
     summaries = [line for line in lines if line.startswith("ui.page") and "'{g} next'" in line]
     if len(summaries) != len(PLAYS):
         problems.append(f"the app showed {len(summaries)} summary screens, expected {len(PLAYS)}")
@@ -489,7 +616,7 @@ def check(out, err, repo, irq_counts):
     return problems
 
 
-def main(firmware, app, free_bytes, holes, hard_irq):
+def main(firmware, app, free_bytes, holes, hard_irq, screen):
     repo = Path(__file__).resolve().parents[2]
     names = json.loads((app / "wedgie.json").read_text())["apps"][0]["files"]
     files = {name: (app / name).read_bytes() for name in names}
@@ -497,7 +624,9 @@ def main(firmware, app, free_bytes, holes, hard_irq):
     script = [(held, tapped) for ticks, held, tapped in SCRIPT for _ in range(ticks)]
     stubs["lcd.py"] = (f"SQUEEZE_BYTES = {SQUEEZE_BYTES}\nWRAP_AFTER_US = {WRAP_AFTER_US}\nLATE_TICK = {LATE_TICK}\n"
                        f"LATE_US = {LATE_US}\nPLAY_COUNT = {len(PLAYS)}\nMENU = {menu_presses()!r}\nSCRIPT = {script!r}\n"
-                       ) + stubs["lcd.py"]
+                       f"SCREEN = {screen}\n") + stubs["lcd.py"]
+    if screen:
+        stubs["screen.py"] = "from __main__ import _PANEL as PANEL\n" + SCREEN_STUB
     stubs["save.py"] = f"LFS_FILE_BYTES = {LFS_FILE_BYTES}\n" + stubs["save.py"]
     stubs["os_stub.py"] = f"NONCE = {RUN_NONCE!r}\n" + stubs["os_stub.py"]
     files.update({name: text.encode() for name, text in stubs.items()})
@@ -510,16 +639,23 @@ def main(firmware, app, free_bytes, holes, hard_irq):
         # The placeholder, the filesystem's objects, the files, then the firmware's modules (the
         # stubs, with the 28,800-byte screen buffer), all before the ballast: on a wedgie the
         # files are in flash, and the free RAM it reports already excludes the firmware's modules.
-        repl.exec(PLACEHOLDER.format(room=sum(map(len, files.values())) + UPLOAD_ROOM))
+        repl.exec(PLACEHOLDER.format(room=sum(map(len, files.values())) + UPLOAD_ROOM + (SCREEN_BYTES if screen else 0)))
         repl.exec(f"_FILES = {{}}\nLFS_FILE_BYTES = {LFS_FILE_BYTES}\n" + VFS)
+        if screen:
+            repl.exec(f"_PANEL = bytearray({SCREEN_BYTES})")
         upload_files(repl, files)
-        repl.exec(PLACEHOLDER.format(room=STUB_ROOM))
+        repl.exec(PLACEHOLDER.format(room=STUB_ROOM + (SCREEN_ROOM if screen else 0)))
         repl.exec("import lcd_buffer, sys, clock, os_stub; sys.modules['time'] = clock; sys.modules['os'] = os_stub")
         repl.exec("import lcd, ui, save, wedgie")
         if hard_irq:
             repl.exec(ARM_HARD_IRQ)
-        print(repl.exec(BALLAST.format(free=free_bytes, holes=holes, hole_bytes=hole_bytes, hole_sizes=HOLE_SIZES,
-                                       size_count=len(HOLE_SIZES))), end="")
+        ballast = repl.exec(BALLAST.format(free=free_bytes, holes=holes, hole_bytes=hole_bytes, hole_sizes=HOLE_SIZES,
+                                           size_count=len(HOLE_SIZES)))
+        print(ballast, end="")
+        # The ballast's last probe of the largest block is garbage of that size, which a stale
+        # reference in the frames of its exec can keep from being collected: the app's files would
+        # then not load. A collection from a new exec frees it, and the check reads that it did.
+        settled = repl.exec("gc.collect(); print(gc.mem_free())")
         out, err = run_app(repl)
         irq_counts = None
         if hard_irq:
@@ -530,7 +666,7 @@ def main(firmware, app, free_bytes, holes, hard_irq):
     print(err.strip().splitlines()[-1] if err.strip() else "")
     if irq_counts:
         print(f"irqsim: {irq_counts[0]} hard IRQs, {irq_counts[1]} in jiro_core, {irq_counts[2]} failed")
-    problems = check(out, err, repo, irq_counts)
+    problems = check_ballast(ballast, settled, free_bytes) + check(out, err, repo, irq_counts, screen)
     for problem in problems:
         print("FAIL:", problem)
     print("qemu play test:", "PASS" if not problems else f"FAIL ({len(problems)})")
@@ -538,10 +674,11 @@ def main(firmware, app, free_bytes, holes, hard_irq):
 
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    hard_irq = args[-1:] == ["--hard-irq"]
-    if hard_irq:
-        args = args[:-1]
-    if len(args) not in (3, 4):
-        raise SystemExit(__doc__)
-    sys.exit(main(args[0], Path(args[1]), int(args[2]), int(args[3]) if len(args) == 4 else HOLES, hard_irq))
+    parser = argparse.ArgumentParser(usage=__doc__, add_help=False)
+    parser.add_argument("firmware")
+    parser.add_argument("app", type=Path)
+    parser.add_argument("free_bytes", type=int)
+    parser.add_argument("holes", type=int, nargs="?", default=HOLES)
+    parser.add_argument("--hard-irq", action="store_true")
+    parser.add_argument("--screen", action="store_true")
+    sys.exit(main(**vars(parser.parse_args())))

@@ -1,12 +1,14 @@
 # Builds the wedgie app from source and checks it: the tests of jiro-core, jiro-shell and the
 # replay command; the native module, jiro_core.mpy, built by MicroPython v1.29.0's mpy_ld, with its
 # size and sha256; every vector of vectors/game/ and vectors/levels/ through it in MicroPython's qemu
-# port for a Cortex-M0, with the stack peaks of start, step and replay; the check app; the app's
-# play test on qemu with the heap filled down to the 137,760 bytes a wedgie has free, plain and with
-# a hard IRQ at every tick, its journals checked against native replay; and that the app files
-# committed in wedgie/app/ are what this commit builds. The MicroPython clone, its pyelftools venv
-# and its mpy-cross and qemu builds live in ~/.cache/jiro-wedgie, cached on MicroPython's commit and
-# the qemu build script. qemu runs under a timeout, because a module that hard-faults hangs it.
+# port for a Cortex-M0, with the stack peaks of start, step and replay; the check app; the frames of
+# the app's tick; the app's play test on qemu, its journals checked against native replay, with the
+# heap filled down to the 137,760 bytes a wedgie has free, plain and with a hard IRQ at every tick,
+# then to the 113,568 a power-up with the WEDGIE drive leaves, then with the screen checked against
+# a full redraw after every tick; and that the app files committed in wedgie/app/ are what this
+# commit builds. The MicroPython clone, its pyelftools venv and its mpy-cross and qemu builds live
+# in ~/.cache/jiro-wedgie, cached on MicroPython's commit and the qemu build script. qemu runs under
+# a timeout, because a module that hard-faults hangs it.
 name: ci
 
 on:
@@ -75,7 +77,7 @@ jobs:
       - name: The check app keeps the wedgie's app limits
         run: bash wedgie/scripts/build-check.sh
 
-      - name: The app keeps the wedgie's app limits
+      - name: The app keeps its tick's frames off the heap, and the wedgie's app limits
         run: bash wedgie/scripts/build-app.sh
 
       - name: The app's play test on qemu at 137,760 bytes free
@@ -88,6 +90,16 @@ jobs:
         run: |
           timeout 600 python3 -I wedgie/scripts/qemu_app_check.py "${{ steps.micropython.outputs.irqsim_firmware }}" \
             wedgie/app 137760 --hard-irq
+
+      - name: The play test at the 113,568 bytes free that a power-up with the WEDGIE drive leaves
+        run: |
+          timeout 600 python3 -I wedgie/scripts/qemu_app_check.py "${{ steps.micropython.outputs.firmware }}" \
+            wedgie/app 113568 50
+
+      - name: The play test with the screen checked against a full redraw after every tick
+        run: |
+          timeout 600 python3 -I wedgie/scripts/qemu_app_check.py "${{ steps.micropython.outputs.firmware }}" \
+            wedgie/app 100000 --screen
 
       - name: The committed app files are this commit's build
         run: bash scripts/check-drift.sh wedgie/app
