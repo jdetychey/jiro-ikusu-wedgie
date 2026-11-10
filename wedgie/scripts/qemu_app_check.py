@@ -18,11 +18,11 @@ the same inputs, so that what the app allocates per level is allocated again. Th
 raises OSError("flash full: ..."), as a wedgie's does when its flash is full, after allocating the
 bests' text and a file object: the app must take its stack back, say on the summary that the best
 is not saved, and play on. The second play of level 1 scores no new best, and its end must store
-the one the first left unsaved; level 2's then stores both. The app's clock is a stub over the port's: its ticks_us
-wraps 2^30 µs shortly after each level's tick 0, and on tick LATE_TICK it jumps LATE_US ahead,
-more than ticks_diff's 2^29 µs range, as a wedgie that stalled that long would see it: the app
-must neither sleep for minutes nor run the ticks it is behind by one after the other, but go on
-from there at 15 ticks a second. Then it checks:
+the one the first left unsaved; level 2's then stores both. The app's clock is a stub over the
+port's: its ticks_us wraps 2^30 µs shortly after each level's tick 0, and on tick LATE_TICK it
+jumps LATE_US ahead, more than ticks_diff's 2^29 µs range, as a wedgie that stalled that long
+would see it: the app must neither sleep for minutes nor run the ticks it is behind by one after
+the other, but go on from there at 15 ticks a second. Then it checks:
 
 - per level, the journal the app printed: its header (Training, the stub's run nonce, the level's
   id from seasons/calibration-1.json, levelIndex 0) and its events, which must be the changes of
@@ -42,9 +42,9 @@ every pixel it drew, then calls the app's own full redraw and checks that it dra
 picture: a cell or an entity that the tick's partial drawing left stale, in the framebuffer or
 on the screen, fails the test. The copy takes 28,800 bytes of the port's heap, above the app's
 files, and its code some room beside the stubs, so the heap holds less than a wedgie's 137,760
-free bytes with it, and what it holds is in more pieces: run it with fewer free bytes, such as
-the 113,568 a power-up with the WEDGIE drive leaves. Its checks run inside the app's ticks, so
-the times it prints are not the app's.
+free bytes with it, and what it holds is in more pieces: run it with fewer free bytes, as CI
+does with 100,000. Its checks run inside the app's ticks, so the times it prints are not the
+app's.
 
 With --hard-irq, on the firmware `build-qemu.sh irqsim` builds, every tick of the port's SysTick,
 from before the ballast on, also calls a Python callback as a hard IRQ, as the wedgie firmware's
@@ -310,7 +310,8 @@ def urandom(n):
 # the heap locked, as a tick's pushes are. After a tick's render, _check counts the bytes the app
 # drew but did not push, then calls the app's full redraw, whose show() counts the bytes it draws
 # otherwise before it copies them. The redraw repaints every cell and the entities where they
-# are, so it leaves the app's state as the tick left it.
+# are, so it leaves the app's state as the tick left it. The first tick with either is given by
+# the play it is in, counted from 1, and its number.
 SCREEN_STUB = """\
 import micropython
 from lcd_buffer import BUF as _BUF
@@ -368,7 +369,7 @@ def watch(training, rows, level, tick):
   _inner['render'], _inner['redraw'] = training.render, training.redraw
   training.render, training.redraw = _render, _redraw
 def result():
-  return ('; screen checked after %d renders: %d B not pushed, %d B unlike a full redraw, first on level %d tick %d'
+  return ('; screen checked after %d renders: %d B not pushed, %d B unlike a full redraw, first on play %d tick %d'
           % tuple(_seen))
 """
 
@@ -581,10 +582,10 @@ def check_screen(err, ticks):
     """The problems of --screen's checks: after every tick's render, the screen showed what the app
     had drawn, which was what its full redraw draws."""
     seen = re.search(r"screen checked after (\d+) renders: (\d+) B not pushed, (\d+) B unlike a full redraw, "
-                     r"first on level (\d+) tick (-?\d+)", err)
+                     r"first on play (\d+) tick (-?\d+)", err)
     if not seen:
         return ["the screen checks were not read: the app did not end"]
-    checked, stale, unlike, level, tick = map(int, seen.groups())
+    checked, stale, unlike, play, tick = map(int, seen.groups())
     print(f"screen: checked after {checked} renders, {stale} bytes drawn but not pushed, {unlike} bytes unlike a full "
           "redraw")
     problems = []
@@ -592,7 +593,8 @@ def check_screen(err, ticks):
         problems.append(f"the screen was checked after {checked} renders, expected every one of the {ticks} ticks")
     if stale or unlike:
         problems.append(f"the screen did not show what a full redraw draws: {stale} bytes drawn but not pushed, {unlike} "
-                        f"bytes unlike a full redraw, over all ticks; first on level {level}, tick {tick}")
+                        f"bytes unlike a full redraw, over all ticks; first on tick {tick} of level {PLAYS[play - 1]}, "
+                        f"play {play} of {len(PLAYS)}")
     return problems
 
 
@@ -670,8 +672,8 @@ def main(firmware, app, free_bytes, holes, hard_irq, screen):
     stubs = dict(STUBS)
     script = [(held, tapped) for ticks, held, tapped in SCRIPT for _ in range(ticks)]
     stubs["lcd.py"] = (f"SQUEEZE_BYTES = {SQUEEZE_BYTES}\nWRAP_AFTER_US = {WRAP_AFTER_US}\nLATE_TICK = {LATE_TICK}\n"
-                       f"LATE_US = {LATE_US}\nEARLY_US = {EARLY_US}\nPLAY_COUNT = {len(PLAYS)}\nMENU = {menu_presses()!r}\nSCRIPT = {script!r}\n"
-                       f"SCREEN = {screen}\n") + stubs["lcd.py"]
+                       f"LATE_US = {LATE_US}\nEARLY_US = {EARLY_US}\nPLAY_COUNT = {len(PLAYS)}\n"
+                       f"MENU = {menu_presses()!r}\nSCRIPT = {script!r}\nSCREEN = {screen}\n") + stubs["lcd.py"]
     if screen:
         stubs["screen.py"] = "from __main__ import _PANEL as PANEL\n" + SCREEN_STUB
     stubs["save.py"] = f"LFS_FILE_BYTES = {LFS_FILE_BYTES}\n" + stubs["save.py"]
