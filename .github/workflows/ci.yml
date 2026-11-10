@@ -2,13 +2,13 @@
 # replay command; the native module, jiro_core.mpy, built by MicroPython v1.29.0's mpy_ld, with its
 # size and sha256; every vector of vectors/game/ and vectors/levels/ through it in MicroPython's qemu
 # port for a Cortex-M0, with the stack peaks of start, step and replay; the check app; the frames of
-# the app's tick; the app's play test on qemu, its journals checked against native replay, with the
-# heap filled down to the 137,760 bytes a wedgie has free, plain and with a hard IRQ at every tick,
-# then to the 113,568 a power-up with the WEDGIE drive leaves, then with the screen checked against
-# a full redraw after every tick; and that the app files committed in wedgie/app/ are what this
-# commit builds. The MicroPython clone, its pyelftools venv and its mpy-cross and qemu builds live
-# in ~/.cache/jiro-wedgie, cached on MicroPython's commit and the qemu build script. qemu runs under
-# a timeout, because a module that hard-faults hangs it.
+# the app's tick; the app's flow on the host; its play test on qemu, its journals checked against
+# native replay, with the heap filled down to the 137,760 bytes a wedgie has free, plain and with a
+# hard IRQ at every tick, then to the 113,568 a power-up with the WEDGIE drive leaves, then with the
+# screen checked against a full redraw after every tick; and that the app files committed in
+# wedgie/app/ are what this commit builds. The MicroPython clone, its pyelftools venv and its
+# mpy-cross and qemu builds live in ~/.cache/jiro-wedgie, cached on MicroPython's commit and the
+# qemu build script. qemu runs under a timeout, because a module that hard-faults hangs it.
 name: ci
 
 on:
@@ -79,6 +79,9 @@ jobs:
 
       - name: The app keeps its tick's frames off the heap, and the wedgie's app limits
         run: bash wedgie/scripts/build-app.sh
+
+      - name: The app's flow on the host, against a stand-in for the core
+        run: python3 -I wedgie/scripts/test_app_flow.py
 
       - name: The app's play test on qemu at 137,760 bytes free
         run: |

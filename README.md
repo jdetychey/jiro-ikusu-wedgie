@@ -39,7 +39,7 @@ Then press green on the wedgie. Installed this way, from a repository rather tha
 | `core/` | jiro-core, the game's rules in Rust: the same code decides every game in the browser and onchain |
 | `shell/` | jiro-shell: which cells changed since the last frame |
 | `wedgie/natmod/` | `jiro_core.mpy`, jiro-core as a MicroPython native module: a Rust crate for the RP2040's Cortex-M0 and its C glue |
-| `wedgie/scripts/` | The build, and the checks on MicroPython's qemu port: every vector through the module, the app's play test, the frames of its tick, the app limits |
+| `wedgie/scripts/` | The build, and the checks on MicroPython's qemu port: every vector through the module, the app's play test, the frames of its tick, the app limits; and the app's flow test, on the host |
 | `wedgie/check/` | The check app, which replays every vector through the module on a wedgie |
 | `levels/`, `seasons/calibration-1.json`, `vectors/` | The 16 levels, their score weights, and the golden vectors the module is checked against |
 | `tools/` | The `replay` command the play test checks the app's journals with |
@@ -65,7 +65,8 @@ The CI (`.github/workflows/ci.yml`) runs:
 - the tests of jiro-core and jiro-shell;
 - every game and level vector through `jiro_core.mpy` on MicroPython's qemu port for a Cortex-M0, with the stack each call uses;
 - the app's play test on qemu: two levels with scripted keys, the heap filled down to the 137,760 bytes a wedgie has free, every journal checked against native replay. It runs plain; with a hard interrupt at every tick, as the wedgie firmware's key interrupt; at the 113,568 bytes that a power-up with the wedgie's USB drive leaves; and with the screen checked after every tick against a full redraw;
-- that the calls of the app's tick keep their Python frames off the heap, but the one of its drawing.
+- that the calls of the app's tick keep their Python frames off the heap, but the one of its drawing;
+- the app's flow on the host, against a stand-in for the core: the level select, a clear and the level after it, each end's summary and its best.
 
 `wedgie/README.md` gives the commands and what each check covers.
 
