@@ -81,11 +81,18 @@ packages_installed() {
   done
 }
 
+# apt must not wait for an answer that nobody gives, nor for a mirror that does not answer: on a
+# CI runner it would wait until the job's time limit, with nothing printed. No prompt, three
+# tries of 30 s for a download, two minutes for dpkg's lock, and 5 minutes for the update and 15
+# for the install in all, after which run_logged prints what apt said.
 install_packages() {
   local sudo=()
   [ "$(id -u)" = 0 ] || sudo=(sudo)
-  run_logged "${sudo[@]}" apt-get update -qq
-  run_logged "${sudo[@]}" apt-get install -y -qq "$@"
+  local quiet=(env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a)
+  local apt=(apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
+    -o DPkg::Lock::Timeout=120)
+  run_logged "${sudo[@]}" "${quiet[@]}" timeout 300 "${apt[@]}" update -qq
+  run_logged "${sudo[@]}" "${quiet[@]}" timeout 900 "${apt[@]}" install -y -qq "$@"
 }
 
 micropython_cloned() {

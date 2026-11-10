@@ -13,24 +13,41 @@ fit, so a smaller filler would land in a smaller block). There too it wraps the 
 jiro_core's step and the app's render in calls that lock the heap, so a tick that allocates fails
 with a MemoryError (the wedgie's own lcd module allocates in show_rect and Keys.pressed, which the
 stubs here do not). The scripted inputs pick level 1, play it with two captures and commit, then
-from the summary go back to the level select, pick level 2 and play it with the same inputs, so
-that what the app allocates per level is allocated twice. The first save.store raises
-OSError("flash full: ..."), as a wedgie's does when its flash is full, after allocating the bests'
-text and a file object: the app must still take its stack back and play level 2, whose store
-saves both bests. The app's clock is a stub over the port's: its ticks_us
-wraps 2^30 µs shortly after each level's tick 0, and on tick LATE_TICK it jumps LATE_US ahead,
-more than ticks_diff's 2^29 µs range, as a wedgie whose ticks fell that far behind would see it:
-the remaining ticks must run at once, late, instead of sleeping for minutes. Then it checks:
+from the summary go back to the level select and play it again, then pick level 2, each time with
+the same inputs, so that what the app allocates per level is allocated again. The first save.store
+raises OSError("flash full: ..."), as a wedgie's does when its flash is full, after allocating the
+bests' text and a file object: the app must take its stack back, say on the summary that the best
+is not saved, and play on. The second play of level 1 scores no new best, and its end must store
+the one the first left unsaved; level 2's then stores both. The app's clock is a stub over the
+port's: its ticks_us wraps 2^30 µs shortly after each level's tick 0, and on tick LATE_TICK it
+jumps LATE_US ahead, more than ticks_diff's 2^29 µs range, as a wedgie that stalled that long
+would see it: the app must neither sleep for minutes nor run the ticks it is behind by one after
+the other, but go on from there at 15 ticks a second. Then it checks:
 
 - per level, the journal the app printed: its header (Training, the stub's run nonce, the level's
   id from seasons/calibration-1.json, levelIndex 0) and its events, which must be the changes of
   the README §6.1 mask that the scripted keys give under D8, Y and the joystick press never in it;
 - per level, the app's end reason, claim, ticks and score against native replay of that journal
   (`jiro-tools replay` with the level's weight), and that it captured something;
-- the best scores it stored, the free heap and largest free block it printed at each stage, a
-  summary screen per level, the first saying its best was not saved, and no overrun before the
-  clock's jump and one on every tick from it on;
-- that the heap was locked over every tick's sample, step and render.
+- the best scores it stored and when, the free heap and largest free block it printed at each
+  stage, a summary screen per level, the first alone saying its best was not saved;
+- per level, one overrun, the tick in which the clock jumps, and one tick that began early, the
+  next, which runs at once: no other tick began less than EARLY_US after the tick before it;
+- that no tick was waited for longer than LONGEST_WAIT_US, and that after each of WAIT_STALLS'
+  stalls, which the clock makes inside the sleep of the app's wait for a tick, that tick began
+  within STUCK_US: the app spends most of a tick in that sleep, so a stall is likeliest there;
+- that the heap was locked over every tick's sample, step and render;
+- that the ballast left the free bytes asked for.
+
+With --screen it also keeps a copy of the screen as the app's pushes leave it (show copies its
+rows into it, show_rect its rectangle), and after every tick's render checks that the app pushed
+every pixel it drew, then calls the app's own full redraw and checks that it draws that same
+picture: a cell or an entity that the tick's partial drawing left stale, in the framebuffer or
+on the screen, fails the test. The copy takes 28,800 bytes of the port's heap, above the app's
+files, and its code some room beside the stubs, so the heap holds less than a wedgie's 137,760
+free bytes with it, and what it holds is in more pieces: run it with fewer free bytes, as CI
+does with 100,000. Its checks run inside the app's ticks, so the times it prints are not the
+app's.
 
 With --hard-irq, on the firmware `build-qemu.sh irqsim` builds, every tick of the port's SysTick,
 from before the ballast on, also calls a Python callback as a hard IRQ, as the wedgie firmware's
@@ -43,15 +60,23 @@ runs with -icount shift=3, 8 ns of virtual time per instruction, and the port's 
 25 MHz SysTick that qemu's nRF51 clocks at 16 MHz, so one microsecond the app measures is
 1,562.5 / 8 = 195.3 instructions (measured with an inline-assembler loop of known length).
 
-Usage: python3 -I qemu_app_check.py <firmware.elf> <app dir> <free bytes> [<holes>] [--hard-irq]
+With --allocations it counts, in place of the lock, the bytes each of a tick's calls takes from
+the heap, by MicroPython's own count (micropython.mem_total): none in the sample and the step,
+and in the render its frame alone. The lock cannot tell: under it a frame over 44 bytes, or the
+array of a bound method's five arguments, goes to the C stack instead of failing.
+
+Usage: python3 -I qemu_app_check.py <firmware.elf> <app dir> <free bytes> [<holes>]
+           [--hard-irq] [--screen | --allocations]
 
 <holes> is the number of small holes among the free bytes, HOLES by default; 0 leaves them all in
 the large block.
 
-Run it under a timeout: a module that hard-faults hangs qemu. Exit status 0 when every check
-passes.
+Run it under a timeout: a module that hard-faults hangs qemu. Run one at a time: while the app
+sleeps, qemu's clock follows the host's, so on a starved host a tick can read as an overrun. Exit
+status 0 when every check passes.
 """
 
+import argparse
 import ast
 import base64
 import importlib.util
@@ -72,7 +97,7 @@ RP2040_MHZ = 125
 ROW_PUSH_US = 45  # a show_rect row on a wedgie (wedgie.dev/code.md)
 RUN_NONCE = bytes.fromhex("277b9e3cebd776c6d46a8b4eb9b83ac165961f4b46a79baef5df1514bb5219cd")
 HEADER_LEN = 71
-PLAYS = (1, 2)  # the levels played, in order, from the level select
+PLAYS = (1, 1, 2)  # the levels played, in order, from the level select
 # MicroPython v1.29.0's rp2 port mounts littlefs with progsize=256, so a file's cache is 1,024
 # bytes, allocated with its 124-byte object (extmod/vfs_lfsx_file.c): the wedgie's "memory
 # allocation failed, allocating 1148 bytes" of round E1's second try.
@@ -82,10 +107,23 @@ SQUEEZE_BYTES = 1024  # round E1's second build measured a largest free block of
 HOLE_SIZES = (64, 256, 448, 128, 320, 512, 192, 384)  # bytes, interleaved with 16-byte live blocks
 UPLOAD_ROOM = 32 * 1024  # what uploading the files needs beside them
 STUB_ROOM = 64 * 1024  # what importing the stubs needs, their 28,800-byte screen buffer included
+SCREEN_BYTES = 28800  # the 240 x 240 screen at 4 bits a pixel: --screen's copy of it
+SCREEN_COLUMNS = 28  # the characters across a line of ui.page: ui.COLS_SMALL (wedgie.dev/code.md)
+SCREEN_ROOM = 8 * 1024  # what importing --screen's stub needs beside the others
+BALLAST_SLACK = 1024  # the ballast leaves the free bytes asked for, to within this many
 STAGES = ("run", "buf", "imp", "lcd", "app", "sel", "lvl")
 WRAP_AFTER_US = 1_500_000  # from the last press outside play, just before tick 0, to the clock's wrap: about tick 22
 LATE_TICK = 70
 LATE_US = 600_000_000
+# After these ticks, the µs the clock jumps inside the sleep of the wait for the next tick, where
+# the app spends most of a tick: a stall of 5 s, then one of 5 s less than the clock's period of
+# 2^30 µs, past ticks_diff's range, after which the due time that passed reads as 5 s ahead. An
+# app that waits for it shows in 5 s, not in the minutes that a stall of LATE_US would take.
+WAIT_STALLS = {30: 5_000_000, 50: (1 << 30) - 5_000_000}
+EARLY_US = 60_000  # a tick that begins sooner than this after the tick before it is early: a tick is 66,667 µs
+STUCK_US = 20_000  # a tick that begins later than this after a stall inside its wait was waited for
+LONGEST_WAIT_US = 500_000  # no tick begins later than this after the tick before it, but for the clock's jumps
+RENDER_FRAME_BYTES = 7 * 16  # check_app_frames.py's 7 heap blocks: all that a tick may take from the heap
 
 # README §6.1 bits of the wedgie's key names (D8); Y and press are not controls.
 BITS = {"up": 1, "down": 2, "left": 4, "right": 8, "A": 16, "B": 32, "X": 64}
@@ -123,6 +161,8 @@ STUBS = {
     "lcd.py": """\
 import clock, framebuf, gc, micropython, sys
 from lcd_buffer import BUF as _BUF
+if SCREEN:
+  import screen
 _PALETTE = ((0, 0, 0), (255, 255, 255), (40, 100, 230), (255, 42, 42), (255, 220, 0), (60, 255, 120),
             (154, 154, 154), (34, 196, 82), (90, 90, 90))
 def color(r, g, b):
@@ -136,10 +176,14 @@ class LCD(framebuf.FrameBuffer):
     if not 0 <= y0 < y1 <= 240:
       raise ValueError('show off the screen: %r' % ((y0, y1),))
     _rows[0] += y1 - y0
+    if SCREEN:
+      screen.show(y0, y1)
   def show_rect(s, x, y, w, h):
     if not (0 <= x and 0 <= y and w > 0 and h > 0 and x + w <= 240 and y + h <= 240):
       raise ValueError('show_rect off the screen: %r' % ((x, y, w, h),))
     _rows[0] += h
+    if SCREEN:
+      screen.show_rect(x, y, w, h)
   def center_text(s, t, y, c, scale=1):
     s.text(t, (240 - 8 * len(t)) // 2, y, c)
 class ScriptDone(Exception):
@@ -158,32 +202,38 @@ def _largest():
       del block
       low = size
   return low
-_inner, _locked = {}, [0, 0, 0]
+_inner, _locked, _most = {}, [0, 0, 0], [0, 0, 0, 0]
+def _enter():
+  micropython.heap_lock()
+def _leave(call):
+  micropython.heap_unlock()
 def _sample(keys):
   _locked[0] += 1
-  micropython.heap_lock()
+  _enter()
   try:
     return _inner['sample'](keys)
   finally:
-    micropython.heap_unlock()
+    _leave(0)
 def _step(recorder, mask, stack):
   _locked[1] += 1
-  micropython.heap_lock()
+  _enter()
   try:
     return _inner['step'](recorder, mask, stack)
   finally:
-    micropython.heap_unlock()
-def _render(app, status, previous):
+    _leave(1)
+def _render(app):
   _locked[2] += 1
-  micropython.heap_lock()
+  _enter()
   try:
-    return _inner['render'](app, status, previous)
+    return _inner['render'](app)
   finally:
-    micropython.heap_unlock()
+    _leave(2)
 def _lock_ticks():
   app, jc = sys.modules['jiro_app'], sys.modules['jiro_core']
   _inner['sample'], _inner['step'], _inner['render'] = app.sample, jc.step, app.Training.render
   app.sample, jc.step, app.Training.render = _sample, _step, _render
+  if SCREEN:
+    screen.watch(app.Training, _rows, _level, _tick)
 def _squeeze():
   for i in range(len(_held)):
     size = _largest()
@@ -194,6 +244,18 @@ def _squeeze():
   if size > SQUEEZE_BYTES:
     raise ValueError('the squeeze left a %d B block' % size)
   print('squeezed: free %d B, largest block %d B' % (gc.mem_free(), size))
+# The end of the scripted inputs, in a call of its own: Keys.pressed, which every tick's sample
+# calls, keeps a frame that stays on the C stack, so that --allocations counts the app's alone.
+# The test's numbers go out one by one: a line formatted whole would need a block of its length,
+# which the heap may not have left when the app runs on the least it can start with.
+def _done():
+  print('test: rows', _rows[1])
+  print('test: calls', _locked[0], _locked[1], _locked[2])
+  print('test: allocated', _most[0], _most[1], _most[2])
+  clock.report()
+  if SCREEN:
+    screen.report()
+  raise ScriptDone('scripted inputs done')
 class Keys:
   def held(s, name):
     _play[0] = True
@@ -202,8 +264,7 @@ class Keys:
     if _play[0] and _tick[0] >= len(_script):
       _level[0] += 1
       if _level[0] == PLAY_COUNT:
-        raise ScriptDone('scripted inputs done; most rows pushed in a tick: %d; heap locked over %d samples, %d steps '
-                         'and %d renders' % (_rows[1], _locked[0], _locked[1], _locked[2]))
+        _done()
       _play[0], _tick[0] = False, 0
     if not _play[0]:
       if not _inner:
@@ -213,10 +274,9 @@ class Keys:
       return _menu.pop(0) if _menu else []
     if _tick[0] == 0:
       _wrap[0] = clock.ticks_us()
-    if _tick[0] == LATE_TICK:
-      if clock.ticks_us() >= _wrap[0]:
-        raise ValueError('the clock did not wrap between tick 0 and tick %d' % LATE_TICK)
-      clock.jump(LATE_US)
+    if _tick[0] == WRAPPED_TICK and clock.ticks_us() >= _wrap[0]:
+      raise ValueError('the clock did not wrap between tick 0 and tick %d' % WRAPPED_TICK)
+    clock.tick(_tick[0], LATE_US if _tick[0] == LATE_TICK else 0, WAIT_STALLS.get(_tick[0], 0))
     if _tick[0]:
       _rows[1] = max(_rows[1], _rows[0])  # what the previous tick pushed
     _rows[0] = 0
@@ -224,16 +284,47 @@ class Keys:
     return _script[_tick[0] - 1][1]
 """,
     # Python's ints stay below 2^30 here, small ints on the port: ticks_us is (port's - _back) mod 2^30.
+    # The lcd stub calls tick as each tick begins, with the µs the clock jumps now, inside the tick,
+    # and those it jumps inside the next sleep, which is the wait for the next tick's. It counts the
+    # ticks that began less than EARLY_US after the tick before, the longest wait between two, and
+    # the jumps made inside a sleep with those after which the tick did not begin within STUCK_US.
     "clock.py": """\
 import time as _time
-_back = [0]
+_back, _began, _early, _longest, _armed, _jumped, _jumps, _stuck = [0], [0], [0], [0], [0], [-1], [0], [0]
 def wrap_in(us):
   _back[0] = (_time.ticks_us() - (0x3fffffff - us)) & 0x3fffffff
 def ticks_us():
   return (_time.ticks_us() - _back[0]) & 0x3fffffff
 def jump(us):
   _back[0] = (_back[0] - us) & 0x3fffffff
-ticks_add, ticks_diff, ticks_ms, sleep_ms = _time.ticks_add, _time.ticks_diff, _time.ticks_ms, _time.sleep_ms
+def sleep_ms(ms):
+  _time.sleep_ms(ms)
+  if _armed[0]:
+    jump(_armed[0])
+    _armed[0] = 0
+    _jumped[0] = ticks_us()
+def tick(number, jump_now, jump_in_sleep):
+  now = ticks_us()
+  if number == 0:
+    _jumped[0] = -1
+  elif _jumped[0] >= 0:
+    _jumps[0] += 1
+    if _time.ticks_diff(now, _jumped[0]) > STUCK_US:
+      _stuck[0] += 1
+    _jumped[0] = -1
+  else:
+    wait = _time.ticks_diff(now, _began[0])
+    if wait < EARLY_US:
+      _early[0] += 1
+    if wait > _longest[0]:
+      _longest[0] = wait
+  if jump_now:
+    jump(jump_now)
+  _armed[0] = jump_in_sleep
+  _began[0] = ticks_us()
+def report():
+  print('test: clock', _early[0], _longest[0], _jumps[0], _stuck[0])
+ticks_add, ticks_diff, ticks_ms = _time.ticks_add, _time.ticks_diff, _time.ticks_ms
 """,
     "ui.py": """\
 WHITE, INK, MUTED, GREEN, GREEN_D, GREY, RED = 1, 0, 6, 7, 7, 8, 3
@@ -269,6 +360,93 @@ def urandom(n):
   return NONCE[:n]
 """,
 }
+
+# --screen's stub, which lcd.py's pushes and its wrapper of the app's render call. PANEL is the
+# glass: the framebuffer's bytes as the pushes left them, allocated with the files, above the
+# heap the app runs in. The copies and the comparison are native code, so that a push copies with
+# the heap locked, as a tick's pushes are. After a tick's render, _check counts the bytes the app
+# drew but did not push, then calls the app's full redraw, whose show() counts the bytes it draws
+# otherwise before it copies them. The redraw repaints every cell and the entities where they
+# are, so it leaves the app's state as the tick left it. The first tick with either is given by
+# the play it is in, counted from 1, and its number.
+SCREEN_STUB = """\
+import micropython
+from lcd_buffer import BUF as _BUF
+_seen, _checking, _redrawing, _inner, _lcd = [0, 0, 0, 0, -1], [False], [0], {}, []
+@micropython.viper
+def _copy(to: ptr8, source: ptr8, start: int, count: int):
+  end = start + count
+  while start < end:
+    to[start] = source[start]
+    start += 1
+@micropython.viper
+def _differing(a: ptr8, b: ptr8, count: int) -> int:
+  differing = 0
+  i = 0
+  while i < count:
+    if a[i] != b[i]:
+      differing += 1
+    i += 1
+  return differing
+def show(y0, y1):
+  if _checking[0]:
+    _seen[2] += _differing(PANEL, _BUF, len(_BUF))
+  _copy(PANEL, _BUF, y0 * 120, (y1 - y0) * 120)
+def show_rect(x, y, w, h):
+  if x & 1 or w & 1:
+    raise ValueError('show_rect splits a byte of two pixels, which the copy does not model: %r' % ((x, y, w, h),))
+  for row in range(y, y + h):
+    _copy(PANEL, _BUF, row * 120 + x // 2, w // 2)
+def _render(app):
+  _inner['render'](app)
+  if not _redrawing[0]:
+    _check(app)
+def _redraw(app):
+  _redrawing[0] += 1
+  try:
+    _inner['redraw'](app)
+  finally:
+    _redrawing[0] -= 1
+def _check(app):
+  rows, level, tick = _lcd
+  pushed, unlike = rows[0], _seen[2]
+  stale = _differing(PANEL, _BUF, len(_BUF))
+  _checking[0] = True
+  try:
+    app.redraw()
+  finally:
+    _checking[0] = False
+  rows[0] = pushed
+  _seen[0] += 1
+  _seen[1] += stale
+  if (stale or _seen[2] != unlike) and _seen[4] < 0:
+    _seen[3], _seen[4] = level[0] + 1, tick[0] - 1
+def watch(training, rows, level, tick):
+  _lcd.extend((rows, level, tick))
+  _inner['render'], _inner['redraw'] = training.render, training.redraw
+  training.render, training.redraw = _render, _redraw
+def report():
+  print('test: screen', _seen[0], _seen[1], _seen[2], _seen[3], _seen[4])
+"""
+
+# The lcd stub's lock over each of a tick's calls, and what takes its place with --allocations: the
+# bytes the call took from the heap, by MicroPython's own count. Under the lock a frame over 44
+# bytes, or the array of a bound method's five arguments, goes to the C stack instead of failing,
+# so the lock alone cannot tell that a tick takes only its drawing's frame from the heap.
+LOCK = """\
+def _enter():
+  micropython.heap_lock()
+def _leave(call):
+  micropython.heap_unlock()
+"""
+COUNT = """\
+def _enter():
+  _most[3] = micropython.mem_total()
+def _leave(call):
+  taken = micropython.mem_total() - _most[3]
+  if taken > _most[call]:
+    _most[call] = taken
+"""
 
 # A RAM filesystem over _FILES, with the seek the app's level reads need.
 VFS = """\
@@ -313,18 +491,22 @@ _P0 = bytearray(gc.mem_free() - {room})
 # bytearray that stays, take its bottom, and a filler trims it, freeing the next largest blocks
 # first if it is too small. Freeing the holes' blocks then leaves about `free` bytes: `hole bytes`
 # in the holes, the rest above them. A bytearray of n bytes is a 16-byte object and its n bytes,
-# in 16-byte blocks.
+# in 16-byte blocks. A block the size _largest just measured can fail to allocate: the last probe
+# of that size is garbage that a stale reference may still hold. Measuring again clears it.
 BALLAST = """\
 import gc
 from lcd import _largest
 _P0 = None
 _R, _H, _K = [None] * 256, [None] * {holes}, [None] * {holes}
-n = 0
-while n < len(_R):
+n = held = 0
+while n < len(_R) and held < 8:
   size = _largest()
   if size < 64:
     break
-  _R[n] = bytearray(size); n += 1
+  try:
+    _R[n] = bytearray(size); n += 1
+  except MemoryError:
+    held += 1
 _R[0] = None
 gc.collect()
 for i in range({holes}):
@@ -446,9 +628,9 @@ def check_level(repo, calibration, level, output, stored):
     if stored.get(key) != score:
         problems.append(f"stored bests {stored}, expected {key}: {score}")
     step_us, render_us, tick_us, overruns = map(int, re.findall(r"\d+", timing))
-    if overruns != ticks - LATE_TICK:
-        problems.append(f"{overruns} overruns, expected {ticks - LATE_TICK}: none before the clock's jump on tick "
-                        f"{LATE_TICK}, then every tick")
+    if overruns != (ticks > LATE_TICK):
+        problems.append(f"{overruns} overruns, expected {int(ticks > LATE_TICK)}: the tick in which the clock jumps, "
+                        f"tick {LATE_TICK}, and no other, a stall inside a wait making no tick end late")
     print(f"level {level} ({level_path.name}): end {end}, claim {claim} bp, ticks {ticks}, score {score}"
           + ("; native replay agrees" if not problems else ""))
     for name, us in (("step", step_us), ("render", render_us), ("tick", tick_us)):
@@ -458,13 +640,117 @@ def check_level(repo, calibration, level, output, stored):
     return problems
 
 
-def check(out, err, repo, irq_counts):
+def check_ballast(ballast, settled, free_bytes):
+    """The problems of the heap the ballast left the app: it must have the free bytes asked for,
+    and still have them once the ballast's probe of the largest block is collected."""
+    left = re.search(r"heap free with ballast (\d+)", ballast)
+    if not left or abs(int(left[1]) - free_bytes) > BALLAST_SLACK:
+        return [f"the ballast left {left[1] if left else 'an unread number of'} bytes free, not the {free_bytes} asked "
+                "for: the port's heap does not hold them beside the test's files"]
+    if abs(int(settled) - int(left[1])) > BALLAST_SLACK:
+        return [f"{settled.strip()} bytes are free after the ballast, not the {left[1]} it left: its probe of the largest "
+                "block is still allocated"]
+    return []
+
+
+def check_screen(seen, ticks):
+    """The problems of --screen's checks: after every tick's render, the screen showed what the app
+    had drawn, which was what its full redraw draws."""
+    if not seen:
+        return ["the screen checks were not read: the app did not end"]
+    checked, stale, unlike, play, tick = seen
+    print(f"screen: checked after {checked} renders, {stale} bytes drawn but not pushed, {unlike} bytes unlike a full "
+          "redraw")
+    problems = []
+    if checked != ticks:
+        problems.append(f"the screen was checked after {checked} renders, expected every one of the {ticks} ticks")
+    if stale or unlike:
+        problems.append(f"the screen did not show what a full redraw draws: {stale} bytes drawn but not pushed, {unlike} "
+                        f"bytes unlike a full redraw, over all ticks; first on tick {tick} of level {PLAYS[play - 1]}, "
+                        f"play {play} of {len(PLAYS)}")
+    return problems
+
+
+def check_bests(calibration, scores, stores, summaries):
+    """The problems of the bests over the plays. The stub fails the first store: that play's
+    summary says its new best is not saved. While a best is not saved, a level's end stores the
+    bests, new best or not; otherwise only a new best does. Each summary says a new best or the
+    best, and that the best is not saved only while it is not."""
+    problems, bests, expected_stores, expected_summaries, calls, unsaved = [], {}, [], [], 0, False
+    for level, score in zip(PLAYS, scores):
+        key = f"{calibration['rulesVersion']}/{calibration['levelIds'][level - 1]}/{calibration['weightsBp'][level - 1]}"
+        words = f"score {score}, " + ("a new best" if score > bests.get(key, -1) else f"best {bests.get(key)}")
+        if score > bests.get(key, -1) or unsaved:
+            bests[key] = max(score, bests.get(key, -1))
+            calls += 1
+            unsaved = calls == 1
+            if not unsaved:
+                expected_stores.append(dict(bests))
+        expected_summaries.append((words, unsaved))
+    if stores != expected_stores:
+        problems.append(f"the app stored {stores}, expected {expected_stores}: the first store fails, the next end "
+                        "stores its best, then each new best is stored")
+    if len(summaries) != len(PLAYS):
+        return problems + [f"the app showed {len(summaries)} summary screens, expected {len(PLAYS)}"]
+    for summary, (words, unsaved) in zip(summaries, expected_summaries):
+        if f"'{words}'" not in summary or ("best not saved: flash full" in summary) != unsaved:
+            problems.append(f"expected a summary with {words!r} and {'' if unsaved else 'not '}that the best was not "
+                            f"saved, the flash full, got {summary}")
+        long = [text for text in ast.literal_eval(summary.split(" ", 2)[2].rsplit(" ", 2)[0]) if len(text) > SCREEN_COLUMNS]
+        if long:
+            problems.append(f"lines of a summary are wider than the screen's {SCREEN_COLUMNS} characters: {long}")
+    return problems
+
+
+def reported(out):
+    """The numbers the stubs print as the scripted inputs end, by name: `test: <name> <number>...`."""
+    lines = (line.split() for line in out.splitlines() if line.startswith("test: "))
+    return {words[1]: list(map(int, words[2:])) for words in lines}
+
+
+def check_clock(clock, ticks):
+    """The problems of the ticks' clock over the levels, of `ticks` ticks each: only the tick after
+    the one in which the clock jumped began early, no stall inside a wait kept the app waiting,
+    and no other tick was waited for longer than LONGEST_WAIT_US."""
+    if not clock:
+        return ["the ticks' clock was not read: the app did not end"]
+    early, longest, stalls, stuck = clock
+    print(f"clock: {early} ticks began early, the longest wait for a tick was {longest} us, and of {stalls} stalls "
+          f"inside a wait {stuck} kept the app waiting")
+    expected_early = sum(level > LATE_TICK + 1 for level in ticks)
+    expected_stalls = sum(level > tick + 1 for level in ticks for tick in WAIT_STALLS)
+    problems = []
+    if early != expected_early:
+        problems.append(f"{early} ticks began less than {EARLY_US} us after the tick before, expected {expected_early}: "
+                        "on each level, the tick after the one in which the clock jumped, alone")
+    if stalls != expected_stalls or stuck:
+        problems.append(f"of {stalls} stalls inside the wait for a tick, {stuck} kept the app waiting more than {STUCK_US} "
+                        f"us; expected {expected_stalls} and none")
+    if longest > LONGEST_WAIT_US:
+        problems.append(f"a tick was waited for {longest} us, more than {LONGEST_WAIT_US}, with no jump of the clock")
+    return problems
+
+
+def check_allocations(most):
+    """The problems of --allocations' count: a tick takes from the heap the frame of its render,
+    and nothing else."""
+    if not most:
+        return ["the allocations were not read: the app did not end"]
+    sample, step, render = most
+    print(f"allocations: at most {sample} bytes in a sample, {step} in a step and {render} in a render")
+    if sample or step or not 0 < render <= RENDER_FRAME_BYTES:
+        return [f"a tick took from the heap at most {sample} bytes in its sample, {step} in its step and {render} in its "
+                f"render; expected 0, 0 and render's frame, of at most {RENDER_FRAME_BYTES}"]
+    return []
+
+
+def check(out, err, repo, irq_counts, screen, allocations):
     lines = out.splitlines()
     calibration = json.loads((repo / "seasons" / "calibration-1.json").read_text())
     problems = []
     if "ScriptDone" not in err:
         problems.append("the app did not run to the end of the scripted inputs: " + err.strip()[-400:])
-    locked = re.search(r"heap locked over (\d+) samples, (\d+) steps and (\d+) renders", err)
+    report = reported(out)
     printed = {re.match(r"jiro: heap (\w+):", line)[1] for line in lines if line.startswith("jiro: heap ")}
     if printed != set(STAGES):
         problems.append(f"the app printed the heap at stages {sorted(printed)}, expected {sorted(STAGES)}")
@@ -476,28 +762,43 @@ def check(out, err, repo, irq_counts):
     for level, output in zip(PLAYS, outputs):
         problems += check_level(repo, calibration, level, output, stored)
     ticks = sum(fields(line, "ticks")[0] for line, _, _ in outputs)
-    if not locked or not int(locked[1]) == int(locked[2]) == ticks <= int(locked[3]):
-        problems.append(f"the heap was locked over {locked and locked[0]}, expected every one of the {ticks} ticks")
-    summaries = [line for line in lines if line.startswith("ui.page") and "'{g} next'" in line]
-    if len(summaries) != len(PLAYS):
-        problems.append(f"the app showed {len(summaries)} summary screens, expected {len(PLAYS)}")
-    elif "best not saved: flash full" not in summaries[0] or "a new best" not in summaries[1]:
-        problems.append(f"expected the first summary's best not saved, the flash full, then a new best: {summaries}")
+    samples, steps, renders = report.get("calls", (0, 0, 0))
+    watched = (f"the heap was {'counted' if allocations else 'locked'} over {samples} samples, {steps} steps and "
+               f"{renders} renders")
+    print(f"most rows pushed in a tick: {report.get('rows', ['unread'])[0]}; {watched}")
+    if not samples == steps == ticks <= renders:
+        problems.append(f"{watched}, expected every one of the {ticks} ticks")
+    problems += check_clock(report.get("clock"), [fields(line, "ticks")[0] for line, _, _ in outputs])
+    if allocations:
+        problems += check_allocations(report.get("allocated"))
+    if screen:
+        problems += check_screen(report.get("screen"), ticks)
+    scores = [fields(line, "score")[0] for line, _, _ in outputs]
+    problems += check_bests(calibration, scores, stores,
+                            [line for line in lines if line.startswith("ui.page") and "'{g} next'" in line])
     if irq_counts is not None and (not irq_counts or irq_counts[1] == 0 or irq_counts[2] != 0):
         problems.append(f"expected hard IRQs that interrupted jiro_core and none that failed, got (dispatched, in "
                         f"jiro_core, failed) {irq_counts or 'unread: the app did not end'}")
     return problems
 
 
-def main(firmware, app, free_bytes, holes, hard_irq):
+def main(firmware, app, free_bytes, holes, hard_irq, screen, allocations):
     repo = Path(__file__).resolve().parents[2]
     names = json.loads((app / "wedgie.json").read_text())["apps"][0]["files"]
     files = {name: (app / name).read_bytes() for name in names}
     stubs = dict(STUBS)
     script = [(held, tapped) for ticks, held, tapped in SCRIPT for _ in range(ticks)]
     stubs["lcd.py"] = (f"SQUEEZE_BYTES = {SQUEEZE_BYTES}\nWRAP_AFTER_US = {WRAP_AFTER_US}\nLATE_TICK = {LATE_TICK}\n"
-                       f"LATE_US = {LATE_US}\nPLAY_COUNT = {len(PLAYS)}\nMENU = {menu_presses()!r}\nSCRIPT = {script!r}\n"
+                       f"LATE_US = {LATE_US}\nWAIT_STALLS = {WAIT_STALLS}\nWRAPPED_TICK = {min(WAIT_STALLS)}\n"
+                       f"PLAY_COUNT = {len(PLAYS)}\nMENU = {menu_presses()!r}\nSCRIPT = {script!r}\nSCREEN = {screen}\n"
                        ) + stubs["lcd.py"]
+    if stubs["lcd.py"].count(LOCK) != 1:
+        raise SystemExit("the lcd stub does not lock the heap as LOCK says")
+    if allocations:
+        stubs["lcd.py"] = stubs["lcd.py"].replace(LOCK, COUNT)
+    stubs["clock.py"] = f"EARLY_US = {EARLY_US}\nSTUCK_US = {STUCK_US}\n" + stubs["clock.py"]
+    if screen:
+        stubs["screen.py"] = "from __main__ import _PANEL as PANEL\n" + SCREEN_STUB
     stubs["save.py"] = f"LFS_FILE_BYTES = {LFS_FILE_BYTES}\n" + stubs["save.py"]
     stubs["os_stub.py"] = f"NONCE = {RUN_NONCE!r}\n" + stubs["os_stub.py"]
     files.update({name: text.encode() for name, text in stubs.items()})
@@ -510,16 +811,23 @@ def main(firmware, app, free_bytes, holes, hard_irq):
         # The placeholder, the filesystem's objects, the files, then the firmware's modules (the
         # stubs, with the 28,800-byte screen buffer), all before the ballast: on a wedgie the
         # files are in flash, and the free RAM it reports already excludes the firmware's modules.
-        repl.exec(PLACEHOLDER.format(room=sum(map(len, files.values())) + UPLOAD_ROOM))
+        repl.exec(PLACEHOLDER.format(room=sum(map(len, files.values())) + UPLOAD_ROOM + (SCREEN_BYTES if screen else 0)))
         repl.exec(f"_FILES = {{}}\nLFS_FILE_BYTES = {LFS_FILE_BYTES}\n" + VFS)
+        if screen:
+            repl.exec(f"_PANEL = bytearray({SCREEN_BYTES})")
         upload_files(repl, files)
-        repl.exec(PLACEHOLDER.format(room=STUB_ROOM))
+        repl.exec(PLACEHOLDER.format(room=STUB_ROOM + (SCREEN_ROOM if screen else 0)))
         repl.exec("import lcd_buffer, sys, clock, os_stub; sys.modules['time'] = clock; sys.modules['os'] = os_stub")
         repl.exec("import lcd, ui, save, wedgie")
         if hard_irq:
             repl.exec(ARM_HARD_IRQ)
-        print(repl.exec(BALLAST.format(free=free_bytes, holes=holes, hole_bytes=hole_bytes, hole_sizes=HOLE_SIZES,
-                                       size_count=len(HOLE_SIZES))), end="")
+        ballast = repl.exec(BALLAST.format(free=free_bytes, holes=holes, hole_bytes=hole_bytes, hole_sizes=HOLE_SIZES,
+                                           size_count=len(HOLE_SIZES)))
+        print(ballast, end="")
+        # The ballast's last probe of the largest block is garbage of that size, which a stale
+        # reference in the frames of its exec can keep from being collected: the app's files would
+        # then not load. A collection from a new exec frees it, and the check reads that it did.
+        settled = repl.exec("gc.collect(); print(gc.mem_free())")
         out, err = run_app(repl)
         irq_counts = None
         if hard_irq:
@@ -530,7 +838,7 @@ def main(firmware, app, free_bytes, holes, hard_irq):
     print(err.strip().splitlines()[-1] if err.strip() else "")
     if irq_counts:
         print(f"irqsim: {irq_counts[0]} hard IRQs, {irq_counts[1]} in jiro_core, {irq_counts[2]} failed")
-    problems = check(out, err, repo, irq_counts)
+    problems = check_ballast(ballast, settled, free_bytes) + check(out, err, repo, irq_counts, screen, allocations)
     for problem in problems:
         print("FAIL:", problem)
     print("qemu play test:", "PASS" if not problems else f"FAIL ({len(problems)})")
@@ -538,10 +846,15 @@ def main(firmware, app, free_bytes, holes, hard_irq):
 
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    hard_irq = args[-1:] == ["--hard-irq"]
-    if hard_irq:
-        args = args[:-1]
-    if len(args) not in (3, 4):
-        raise SystemExit(__doc__)
-    sys.exit(main(args[0], Path(args[1]), int(args[2]), int(args[3]) if len(args) == 4 else HOLES, hard_irq))
+    parser = argparse.ArgumentParser(usage=__doc__, add_help=False)
+    parser.add_argument("firmware")
+    parser.add_argument("app", type=Path)
+    parser.add_argument("free_bytes", type=int)
+    parser.add_argument("holes", type=int, nargs="?", default=HOLES)
+    parser.add_argument("--hard-irq", action="store_true")
+    parser.add_argument("--screen", action="store_true")
+    parser.add_argument("--allocations", action="store_true")
+    arguments = parser.parse_args()
+    if arguments.screen and arguments.allocations:
+        parser.error("--allocations would count what --screen's code takes from the heap inside a render: run them apart")
+    sys.exit(main(**vars(arguments)))

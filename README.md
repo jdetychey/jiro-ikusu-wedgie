@@ -17,15 +17,15 @@ On the level select, the joystick picks a level and green plays it. After a leve
 
 ## Saves
 
-The app keeps one best score per level in the save `bests`, under `/saves/jiro/`. Installing an app, this one or another, never touches it.
+The app keeps one best score per level in the save `bests`, under `/saves/jiro/`. Installing an app, this one or another, never touches it. If the save cannot be written, on a full flash for instance, the level's summary says that the best is not saved, and the next level's end tries again.
 
 ## Install
 
-With wedgie's command-line tool, [wedgie.py](https://wedgie.dev/wedgie.py), from the app's folder:
+With wedgie's command-line tool, [wedgie.py](https://wedgie.dev/wedgie.py), which is not in this repository and needs pyserial, from the repository's root:
 
 ```bash
-cd wedgie/app
-python3 wedgie.py install .
+curl -O https://wedgie.dev/wedgie.py
+python3 wedgie.py install wedgie/app
 ```
 
 Then press green on the wedgie. Installed this way, from a repository rather than from wedgie.dev's shelf, the app is not signed by wedgie.dev and installs with full access. This one only draws, reads the keys and keeps its save. If a wedgie hangs on an app, unplug it, hold both grey buttons (B and X) while plugging it back in, which starts it without its app, then run `python3 wedgie.py uninstall`.
@@ -39,7 +39,7 @@ Then press green on the wedgie. Installed this way, from a repository rather tha
 | `core/` | jiro-core, the game's rules in Rust: the same code decides every game in the browser and onchain |
 | `shell/` | jiro-shell: which cells changed since the last frame |
 | `wedgie/natmod/` | `jiro_core.mpy`, jiro-core as a MicroPython native module: a Rust crate for the RP2040's Cortex-M0 and its C glue |
-| `wedgie/scripts/` | The build, and the checks on MicroPython's qemu port: every vector through the module, the app's play test, the app limits |
+| `wedgie/scripts/` | The build, and the checks on MicroPython's qemu port: every vector through the module, the app's play test, the frames of its tick, the app limits; and the app's flow test, on the host |
 | `wedgie/check/` | The check app, which replays every vector through the module on a wedgie |
 | `levels/`, `seasons/calibration-1.json`, `vectors/` | The 16 levels, their score weights, and the golden vectors the module is checked against |
 | `tools/` | The `replay` command the play test checks the app's journals with |
@@ -64,13 +64,15 @@ The CI (`.github/workflows/ci.yml`) runs:
 
 - the tests of jiro-core and jiro-shell;
 - every game and level vector through `jiro_core.mpy` on MicroPython's qemu port for a Cortex-M0, with the stack each call uses;
-- the app's play test on qemu: two levels with scripted keys, the heap filled down to the 137,760 bytes a wedgie has free, every journal checked against native replay. It runs plain and with a hard interrupt at every tick, as the wedgie firmware's key interrupt.
+- the app's play test on qemu: two levels with scripted keys, the heap filled down to the 137,760 bytes a wedgie has free, every journal checked against native replay. It runs plain; with a hard interrupt at every tick, as the wedgie firmware's key interrupt; at the 113,568 bytes that a power-up with the wedgie's USB drive leaves; with the screen checked after every tick against a full redraw; and with what a tick takes from the heap counted;
+- that the calls of the app's tick keep their Python frames off the heap, but the one of its drawing;
+- the app's flow on the host, against a stand-in for the core: the level select, a clear and the level after it, each end's summary and its best.
 
 `wedgie/README.md` gives the commands and what each check covers.
 
 ## Memory and timing
 
-The app needs about 62 KB of RAM in three blocks: a 24 KB stack for the core, the core's 18.5 KB Recorder, and the module's 18.6 KB. It allocates them first, while the heap is in one piece. A power-up also starts the wedgie's USB drive, which leaves about 113.6 KB free; on a heap like that the app keeps about 33 KB free at the level select, and about 58 KB without the drive. A tick's game step takes under 10 ms on a wedgie. A capture of most of the field takes longer to draw, about one tick, and the app pushes it as full-width rows, the screen's fast path.
+The app needs about 62 KB of RAM in three blocks: a 24 KB stack for the core, the core's 18.5 KB Recorder, and the module's 18.6 KB. It allocates them first, while the heap is in one piece. A power-up also starts the wedgie's USB drive, which leaves about 113.6 KB free; on a heap like that the app keeps about 36 KB free at the level select, and about 60 KB without the drive. A tick's game step takes under 10 ms on a wedgie. A capture of most of the field takes longer to draw, about one tick, and the app pushes it as full-width rows, the screen's fast path.
 
 ## Where it comes from
 
@@ -79,9 +81,10 @@ This repository is the wedgie part of Jiro-ikusu, whose main repository is priva
 - this README, `wedgie.json` at the root, `.github/workflows/ci.yml`, `scripts/bootstrap.sh` (its wedgie tier only) and `Cargo.toml` at the root;
 - `tools/`, cut down to the `replay` command;
 - `core/tests/`, without the two suites that need the main repository: its property tests, and its index of the specification's rules;
-- `wedgie/natmod/rust/`, a member of the root workspace, which makes the module's bytes the same in every checkout.
+- `wedgie/natmod/rust/`, a member of the root workspace, which makes the module's bytes the same in every checkout;
+- since 2026-11-10, the app's own code, refactored and fixed in this repository: `wedgie/app/jiro.py`, `jiro_app.py` and the `jiro_app.mpy` built from it; the play test, and the checks new here, `check_app_frames.py` and `test_app_flow.py`, in `wedgie/scripts/`; and what `wedgie/README.md` and the report say of them. The last section of the report's qemu part lists the changes and what was measured. `jiro_core.mpy` and the level file are the same bytes as before.
 
-`wedgie/README.md` and the report are copied as they are. Their references to `README.md`, `IMPLEMENTATION_PLAN.md` and `docs/` point into the main repository.
+The rest of `wedgie/README.md` and of the report is copied as it is. Their references to `README.md`, `IMPLEMENTATION_PLAN.md` and `docs/` point into the main repository.
 
 ## License
 
