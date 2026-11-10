@@ -412,6 +412,15 @@ class Flow(unittest.TestCase):
                             wedgie.stages.append)
 
 
+class Manifests(unittest.TestCase):
+    def test_the_manifest_wedgie_dev_reads_is_the_app_folders(self):
+        """wedgie.json at the root, for wedgie.dev's shelf, and the one `wedgie.py install .` reads
+        in wedgie/app/ describe one app: the same fields, and the same files by their paths."""
+        (shelf,), (folder,) = (json.loads((where / "wedgie.json").read_text())["apps"] for where in (REPO, APP))
+        self.assertEqual(shelf.pop("files"), ["wedgie/app/" + name for name in folder.pop("files")])
+        self.assertEqual(shelf, folder)
+
+
 class Ticks(unittest.TestCase):
     """The tick's clock: 15 ticks a second, a late tick made up for by the next, and a tick more
     than one tick late not made up for at all."""
