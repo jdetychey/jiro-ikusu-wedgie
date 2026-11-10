@@ -64,7 +64,7 @@ The CI (`.github/workflows/ci.yml`) runs:
 
 - the tests of jiro-core and jiro-shell;
 - every game and level vector through `jiro_core.mpy` on MicroPython's qemu port for a Cortex-M0, with the stack each call uses;
-- the app's play test on qemu: two levels with scripted keys, the heap filled down to the 137,760 bytes a wedgie has free, every journal checked against native replay. It runs plain; with a hard interrupt at every tick, as the wedgie firmware's key interrupt; at the 113,568 bytes that a power-up with the wedgie's USB drive leaves; and with the screen checked after every tick against a full redraw;
+- the app's play test on qemu: two levels with scripted keys, the heap filled down to the 137,760 bytes a wedgie has free, every journal checked against native replay. It runs plain; with a hard interrupt at every tick, as the wedgie firmware's key interrupt; at the 113,568 bytes that a power-up with the wedgie's USB drive leaves; with the screen checked after every tick against a full redraw; and with what a tick takes from the heap counted;
 - that the calls of the app's tick keep their Python frames off the heap, but the one of its drawing;
 - the app's flow on the host, against a stand-in for the core: the level select, a clear and the level after it, each end's summary and its best.
 
