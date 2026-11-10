@@ -72,7 +72,7 @@ The CI (`.github/workflows/ci.yml`) runs:
 
 ## Memory and timing
 
-The app needs about 62 KB of RAM in three blocks: a 24 KB stack for the core, the core's 18.5 KB Recorder, and the module's 18.6 KB. It allocates them first, while the heap is in one piece. A power-up also starts the wedgie's USB drive, which leaves about 113.6 KB free; on a heap like that the app keeps about 33 KB free at the level select, and about 58 KB without the drive. A tick's game step takes under 10 ms on a wedgie. A capture of most of the field takes longer to draw, about one tick, and the app pushes it as full-width rows, the screen's fast path.
+The app needs about 62 KB of RAM in three blocks: a 24 KB stack for the core, the core's 18.5 KB Recorder, and the module's 18.6 KB. It allocates them first, while the heap is in one piece. A power-up also starts the wedgie's USB drive, which leaves about 113.6 KB free; on a heap like that the app keeps about 36 KB free at the level select, and about 60 KB without the drive. A tick's game step takes under 10 ms on a wedgie. A capture of most of the field takes longer to draw, about one tick, and the app pushes it as full-width rows, the screen's fast path.
 
 ## Where it comes from
 
@@ -81,9 +81,10 @@ This repository is the wedgie part of Jiro-ikusu, whose main repository is priva
 - this README, `wedgie.json` at the root, `.github/workflows/ci.yml`, `scripts/bootstrap.sh` (its wedgie tier only) and `Cargo.toml` at the root;
 - `tools/`, cut down to the `replay` command;
 - `core/tests/`, without the two suites that need the main repository: its property tests, and its index of the specification's rules;
-- `wedgie/natmod/rust/`, a member of the root workspace, which makes the module's bytes the same in every checkout.
+- `wedgie/natmod/rust/`, a member of the root workspace, which makes the module's bytes the same in every checkout;
+- since 2026-11-10, the app's own code, refactored and fixed in this repository: `wedgie/app/jiro.py`, `jiro_app.py` and the `jiro_app.mpy` built from it; the play test, and the checks new here, `check_app_frames.py` and `test_app_flow.py`, in `wedgie/scripts/`; and what `wedgie/README.md` and the report say of them. The last section of the report's qemu part lists the changes and what was measured. `jiro_core.mpy` and the level file are the same bytes as before.
 
-`wedgie/README.md` and the report are copied as they are. Their references to `README.md`, `IMPLEMENTATION_PLAN.md` and `docs/` point into the main repository.
+The rest of `wedgie/README.md` and of the report is copied as it is. Their references to `README.md`, `IMPLEMENTATION_PLAN.md` and `docs/` point into the main repository.
 
 ## License
 
