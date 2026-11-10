@@ -415,18 +415,22 @@ _P0 = bytearray(gc.mem_free() - {room})
 # bytearray that stays, take its bottom, and a filler trims it, freeing the next largest blocks
 # first if it is too small. Freeing the holes' blocks then leaves about `free` bytes: `hole bytes`
 # in the holes, the rest above them. A bytearray of n bytes is a 16-byte object and its n bytes,
-# in 16-byte blocks.
+# in 16-byte blocks. A block the size _largest just measured can fail to allocate: the last probe
+# of that size is garbage that a stale reference may still hold. Measuring again clears it.
 BALLAST = """\
 import gc
 from lcd import _largest
 _P0 = None
 _R, _H, _K = [None] * 256, [None] * {holes}, [None] * {holes}
-n = 0
-while n < len(_R):
+n = held = 0
+while n < len(_R) and held < 8:
   size = _largest()
   if size < 64:
     break
-  _R[n] = bytearray(size); n += 1
+  try:
+    _R[n] = bytearray(size); n += 1
+  except MemoryError:
+    held += 1
 _R[0] = None
 gc.collect()
 for i in range({holes}):
