@@ -180,6 +180,7 @@ class Training:
         self.stack_slot, self.recorder, self.shadow = stack_slot, recorder, shadow
         self.level, self.level_file, self.bests = level, level_file, bests
         self.heap = heap
+        self.unsaved = None  # while a store has failed and the save lacks a best: that store's errno
         self.screen, self.keys = lcd.LCD(), lcd.Keys()
         heap("lcd")
         self.frame = self.screen.buffer
@@ -373,17 +374,20 @@ class Training:
     # Its end.
 
     def finish(self, index, end, timing):
-        """The between-level screen: the claim, the score and the lives, and the best; the
-        timing goes to USB only. The score is the core's, with the calibration's weight. The
-        screen comes before the USB output, since a print blocks for about 500 ms when a host
+        """The between-level screen: the claim, the score and the lives, and the best, with a
+        line more while the bests are not saved; the timing goes to USB only. The score is the
+        core's, with the calibration's weight. No line is longer than the screen's 28 characters.
+        The screen comes before the USB output, since a print blocks for about 500 ms when a host
         holds the port open without reading it."""
         name, weight, _, _ = self.levels[index]
         status = self.status
         score = jc.score(self.recorder, weight)
-        ui.page(self.screen, END_TITLES[end],
-                [("claim %d.%02d %%" % (status[_CLAIM] // 100, status[_CLAIM] % 100), ui.INK),
+        lines = [("claim %d.%02d %%" % (status[_CLAIM] // 100, status[_CLAIM] % 100), ui.INK),
                  ("score %d, %s" % (score, self.keep_best(index, score)), ui.INK),
-                 ("%d lives, %d ticks" % (status[_LIVES], status[_TICKS]), ui.MUTED)], "{g} next")
+                 ("%d lives, %d ticks" % (status[_LIVES], status[_TICKS]), ui.MUTED)]
+        if self.unsaved is not None:
+            lines.append(("best not saved: " + ("flash full" if self.unsaved == 0 else "errno %d" % self.unsaved), ui.RED))
+        ui.page(self.screen, END_TITLES[end], lines, "{g} next")
         print("jiro: level %d %s end %d claim_bp %d ticks %d lives %d score %d" % (
             index + 1, name, end, status[_CLAIM], status[_TICKS], status[_LIVES], score))
         print("jiro: step max %d us, render max %d us, worst tick %d us, overruns %d" % timing)
@@ -414,16 +418,20 @@ class Training:
         return "%d/0x%s/%d" % (jc.rules_version(), hexlify(level_id).decode(), weight)
 
     def keep_best(self, index, score):
-        """Keeps and stores `score` if it is the level's best; returns the summary's words for it."""
+        """Keeps `score` if it is the level's best, and stores the bests if it is, or if a store
+        failed since the last one that did not: a best that a full flash kept out of the save is
+        stored at the next level's end, new best or not. Returns the summary's words for the best."""
         key = self.best_key(index)
         best = self.bests.get(key)
-        if best is not None and score <= best:
-            return "best %d" % best
-        self.bests[key] = score
-        errno = self.store_bests()
-        if errno is None:
-            return "a new best"
-        return "best not saved: " + ("flash full" if errno == 0 else "errno %d" % errno)
+        if best is None or score > best:
+            self.bests[key] = score
+            words = "a new best"
+        else:
+            words = "best %d" % best
+            if self.unsaved is None:
+                return words
+        self.unsaved = self.store_bests()
+        return words
 
     def store_bests(self):
         """Stores the bests in the core's stack's block, idle between levels, then takes the stack

@@ -13,11 +13,12 @@ fit, so a smaller filler would land in a smaller block). There too it wraps the 
 jiro_core's step and the app's render in calls that lock the heap, so a tick that allocates fails
 with a MemoryError (the wedgie's own lcd module allocates in show_rect and Keys.pressed, which the
 stubs here do not). The scripted inputs pick level 1, play it with two captures and commit, then
-from the summary go back to the level select, pick level 2 and play it with the same inputs, so
-that what the app allocates per level is allocated twice. The first save.store raises
-OSError("flash full: ..."), as a wedgie's does when its flash is full, after allocating the bests'
-text and a file object: the app must still take its stack back and play level 2, whose store
-saves both bests. The app's clock is a stub over the port's: its ticks_us
+from the summary go back to the level select and play it again, then pick level 2, each time with
+the same inputs, so that what the app allocates per level is allocated again. The first save.store
+raises OSError("flash full: ..."), as a wedgie's does when its flash is full, after allocating the
+bests' text and a file object: the app must take its stack back, say on the summary that the best
+is not saved, and play on. The second play of level 1 scores no new best, and its end must store
+the one the first left unsaved; level 2's then stores both. The app's clock is a stub over the port's: its ticks_us
 wraps 2^30 µs shortly after each level's tick 0, and on tick LATE_TICK it jumps LATE_US ahead,
 more than ticks_diff's 2^29 µs range, as a wedgie whose ticks fell that far behind would see it:
 the remaining ticks must run at once, late, instead of sleeping for minutes. Then it checks:
@@ -27,9 +28,9 @@ the remaining ticks must run at once, late, instead of sleeping for minutes. The
   the README §6.1 mask that the scripted keys give under D8, Y and the joystick press never in it;
 - per level, the app's end reason, claim, ticks and score against native replay of that journal
   (`jiro-tools replay` with the level's weight), and that it captured something;
-- the best scores it stored, the free heap and largest free block it printed at each stage, a
-  summary screen per level, the first saying its best was not saved, and no overrun before the
-  clock's jump and one on every tick from it on;
+- the best scores it stored and when, the free heap and largest free block it printed at each
+  stage, a summary screen per level, the first alone saying its best was not saved, and no overrun
+  before the clock's jump and one on every tick from it on;
 - that the heap was locked over every tick's sample, step and render;
 - that the ballast left the free bytes asked for.
 
@@ -85,7 +86,7 @@ RP2040_MHZ = 125
 ROW_PUSH_US = 45  # a show_rect row on a wedgie (wedgie.dev/code.md)
 RUN_NONCE = bytes.fromhex("277b9e3cebd776c6d46a8b4eb9b83ac165961f4b46a79baef5df1514bb5219cd")
 HEADER_LEN = 71
-PLAYS = (1, 2)  # the levels played, in order, from the level select
+PLAYS = (1, 1, 2)  # the levels played, in order, from the level select
 # MicroPython v1.29.0's rp2 port mounts littlefs with progsize=256, so a file's cache is 1,024
 # bytes, allocated with its 124-byte object (extmod/vfs_lfsx_file.c): the wedgie's "memory
 # allocation failed, allocating 1148 bytes" of round E1's second try.
@@ -96,6 +97,7 @@ HOLE_SIZES = (64, 256, 448, 128, 320, 512, 192, 384)  # bytes, interleaved with 
 UPLOAD_ROOM = 32 * 1024  # what uploading the files needs beside them
 STUB_ROOM = 64 * 1024  # what importing the stubs needs, their 28,800-byte screen buffer included
 SCREEN_BYTES = 28800  # the 240 x 240 screen at 4 bits a pixel: --screen's copy of it
+SCREEN_COLUMNS = 28  # the characters across a line of ui.page: ui.COLS_SMALL (wedgie.dev/code.md)
 SCREEN_ROOM = 8 * 1024  # what importing --screen's stub needs beside the others
 BALLAST_SLACK = 1024  # the ballast leaves the free bytes asked for, to within this many
 STAGES = ("run", "buf", "imp", "lcd", "app", "sel", "lvl")
@@ -583,6 +585,37 @@ def check_screen(err, ticks):
     return problems
 
 
+def check_bests(calibration, scores, stores, summaries):
+    """The problems of the bests over the plays. The stub fails the first store: that play's
+    summary says its new best is not saved. While a best is not saved, a level's end stores the
+    bests, new best or not; otherwise only a new best does. Each summary says a new best or the
+    best, and that the best is not saved only while it is not."""
+    problems, bests, expected_stores, expected_summaries, calls, unsaved = [], {}, [], [], 0, False
+    for level, score in zip(PLAYS, scores):
+        key = f"{calibration['rulesVersion']}/{calibration['levelIds'][level - 1]}/{calibration['weightsBp'][level - 1]}"
+        words = f"score {score}, " + ("a new best" if score > bests.get(key, -1) else f"best {bests.get(key)}")
+        if score > bests.get(key, -1) or unsaved:
+            bests[key] = max(score, bests.get(key, -1))
+            calls += 1
+            unsaved = calls == 1
+            if not unsaved:
+                expected_stores.append(dict(bests))
+        expected_summaries.append((words, unsaved))
+    if stores != expected_stores:
+        problems.append(f"the app stored {stores}, expected {expected_stores}: the first store fails, the next end "
+                        "stores its best, then each new best is stored")
+    if len(summaries) != len(PLAYS):
+        return problems + [f"the app showed {len(summaries)} summary screens, expected {len(PLAYS)}"]
+    for summary, (words, unsaved) in zip(summaries, expected_summaries):
+        if f"'{words}'" not in summary or ("best not saved: flash full" in summary) != unsaved:
+            problems.append(f"expected a summary with {words!r} and {'' if unsaved else 'not '}that the best was not "
+                            f"saved, the flash full, got {summary}")
+        long = [text for text in ast.literal_eval(summary.split(" ", 2)[2].rsplit(" ", 2)[0]) if len(text) > SCREEN_COLUMNS]
+        if long:
+            problems.append(f"lines of a summary are wider than the screen's {SCREEN_COLUMNS} characters: {long}")
+    return problems
+
+
 def check(out, err, repo, irq_counts, screen):
     lines = out.splitlines()
     calibration = json.loads((repo / "seasons" / "calibration-1.json").read_text())
@@ -605,11 +638,9 @@ def check(out, err, repo, irq_counts, screen):
         problems.append(f"the heap was locked over {locked and locked[0]}, expected every one of the {ticks} ticks")
     if screen:
         problems += check_screen(err, ticks)
-    summaries = [line for line in lines if line.startswith("ui.page") and "'{g} next'" in line]
-    if len(summaries) != len(PLAYS):
-        problems.append(f"the app showed {len(summaries)} summary screens, expected {len(PLAYS)}")
-    elif "best not saved: flash full" not in summaries[0] or "a new best" not in summaries[1]:
-        problems.append(f"expected the first summary's best not saved, the flash full, then a new best: {summaries}")
+    scores = [fields(line, "score")[0] for line, _, _ in outputs]
+    problems += check_bests(calibration, scores, stores,
+                            [line for line in lines if line.startswith("ui.page") and "'{g} next'" in line])
     if irq_counts is not None and (not irq_counts or irq_counts[1] == 0 or irq_counts[2] != 0):
         problems.append(f"expected hard IRQs that interrupted jiro_core and none that failed, got (dispatched, in "
                         f"jiro_core, failed) {irq_counts or 'unread: the app did not end'}")

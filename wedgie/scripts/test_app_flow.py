@@ -18,6 +18,7 @@ import types
 import unittest
 from pathlib import Path
 
+sys.dont_write_bytecode = True  # importing the app leaves nothing in its folder
 REPO = Path(__file__).resolve().parents[2]
 APP = REPO / "wedgie" / "app"
 CALIBRATION = json.loads((REPO / "seasons" / "calibration-1.json").read_text())
@@ -25,6 +26,7 @@ COLS_SMALL = 28  # ui.COLS_SMALL: the characters across a line of ui.page (wedgi
 PRESS_AFTER_MS = 1000  # a scripted press comes this long after its screen, past the screens' guards
 IDLE_MS = 5000  # with no press left to make, the run ends this long after the last screen
 COMMITTED, CLEARED, OUT_OF_LIVES, TIME_UP = 1, 2, 3, 4
+INK, MUTED, RED = 0, 6, 3  # ui's colors
 # The fields of jiro_core.status, as jiro_app.py names them.
 END, TICKS, TIME_LIMIT, LIVES, SHIELD, INVULNERABLE, CUTTING, CLAIM, TARGET = range(9)
 PLAYER_X, PLAYER_Y, BOSS_X, BOSS_Y, BOSS_SIZE, MINIONS = 9, 10, 11, 12, 13, 14
@@ -70,7 +72,7 @@ class Wedgie:
         self.bests = {} if bests is None else bests
         self.entities = status or {}
         self.clock = Clock()
-        self.pages, self.overlays, self.stores, self.stages, self.pushes = [], [], [], [], []
+        self.pages, self.colors, self.overlays, self.stores, self.stages, self.pushes = [], [], [], [], [], []
         self.playing = None  # the level in play: its bytes, its outcome and the ticks stepped
         self.screen_at = 0
         self.level_file = open(APP / "jiro_levels.bin", "rb")
@@ -108,14 +110,14 @@ class Wedgie:
 
         def page(screen, head, lines, hint):
             wedgie.pages.append((head, [text for text, _ in lines], hint))
-            wedgie.colors = [color for _, color in lines]
+            wedgie.colors.append([color for _, color in lines])
             wedgie.screen_at = wedgie.clock.us
 
         return {
             "time": self.clock,
             "micropython": types.SimpleNamespace(const=lambda value: value),
             "lcd": types.SimpleNamespace(LCD=LCD, Keys=Keys, color=lambda r, g, b: (r + g + b) % 16),
-            "ui": types.SimpleNamespace(page=page, WHITE=1, INK=0, MUTED=6, RED=3),
+            "ui": types.SimpleNamespace(page=page, WHITE=1, INK=INK, MUTED=MUTED, RED=RED),
             "save": types.SimpleNamespace(store=self.store),
             "jiro_core": types.SimpleNamespace(
                 rules_version=lambda: CALIBRATION["rulesVersion"], recorder_size=lambda: 64, start=self.start,
@@ -293,6 +295,25 @@ class Flow(unittest.TestCase):
                                          ("bests", {"an older rules version's": 7, best_key(1): score(1, 3001)})])
         self.assertEqual(wedgie.pages[-1][1], ["Open", f"best {score(1, 3001)}"])
         self.assertEqual(len(wedgie.stack_slot[0]), 64, "the app took the core's stack back after each store")
+
+    def test_a_best_that_a_store_failed_to_save_is_stored_at_the_next_end(self):
+        for error, words in ((OSError("flash full: delete some saves at wedgie.dev"), "flash full"),
+                             (OSError(28, "ENOSPC"), "errno 28")):
+            with self.subTest(words):
+                # Level 16's highest score, then a lower one twice: no new best, but one to save.
+                wedgie = self.play(outcomes=[(5, COMMITTED, 10000, 5), (5, COMMITTED, 100, 3), (5, COMMITTED, 100, 3)],
+                                   presses=["left", "A", "A", "A", "A", "A", "A"], store_errors=[error, error])
+                summaries = [(lines, colors) for (head, lines, _), colors in zip(wedgie.pages, wedgie.colors)
+                             if head == "Committed"]
+                best = score(16, 10000)
+                self.assertEqual(summaries[0], (["claim 100.00 %", f"score {best}, a new best", "5 lives, 5 ticks",
+                                                 f"best not saved: {words}"], [INK, INK, MUTED, RED]))
+                self.assertEqual(summaries[1], (["claim 1.00 %", f"score {score(16, 100)}, best {best}", "3 lives, 5 ticks",
+                                                 f"best not saved: {words}"], [INK, INK, MUTED, RED]))
+                self.assertEqual(summaries[2], (["claim 1.00 %", f"score {score(16, 100)}, best {best}", "3 lives, 5 ticks"],
+                                                [INK, INK, MUTED]))
+                self.assertEqual(wedgie.stores, [("bests", {best_key(16): best})])
+                self.assertEqual(len(wedgie.stack_slot[0]), 64, "the app took the core's stack back after each store")
 
     def test_the_overlay_names_the_level_its_target_and_its_lives(self):
         wedgie = self.play(outcomes=[(3, COMMITTED, 0, 5)], presses=["A", "A"])

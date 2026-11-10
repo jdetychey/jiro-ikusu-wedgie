@@ -17,7 +17,7 @@ On the level select, the joystick picks a level and green plays it. After a leve
 
 ## Saves
 
-The app keeps one best score per level in the save `bests`, under `/saves/jiro/`. Installing an app, this one or another, never touches it.
+The app keeps one best score per level in the save `bests`, under `/saves/jiro/`. Installing an app, this one or another, never touches it. If the save cannot be written, on a full flash for instance, the level's summary says that the best is not saved, and the next level's end tries again.
 
 ## Install
 
