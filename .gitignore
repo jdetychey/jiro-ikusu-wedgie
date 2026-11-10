@@ -1,5 +1,7 @@
 target/
 __pycache__/
+# wedgie's command-line tool, downloaded here for an install (README.md).
+/wedgie.py
 # Build outputs; the app's own files in wedgie/app/ are committed: they are what a wedgie installs.
 wedgie/natmod/glue/build/
 wedgie/natmod/glue/jiro_core.mpy

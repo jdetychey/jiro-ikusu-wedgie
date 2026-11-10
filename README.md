@@ -21,11 +21,11 @@ The app keeps one best score per level in the save `bests`, under `/saves/jiro/`
 
 ## Install
 
-With wedgie's command-line tool, [wedgie.py](https://wedgie.dev/wedgie.py), from the app's folder:
+With wedgie's command-line tool, [wedgie.py](https://wedgie.dev/wedgie.py), which is not in this repository and needs pyserial, from the repository's root:
 
 ```bash
-cd wedgie/app
-python3 wedgie.py install .
+curl -O https://wedgie.dev/wedgie.py
+python3 wedgie.py install wedgie/app
 ```
 
 Then press green on the wedgie. Installed this way, from a repository rather than from wedgie.dev's shelf, the app is not signed by wedgie.dev and installs with full access. This one only draws, reads the keys and keeps its save. If a wedgie hangs on an app, unplug it, hold both grey buttons (B and X) while plugging it back in, which starts it without its app, then run `python3 wedgie.py uninstall`.

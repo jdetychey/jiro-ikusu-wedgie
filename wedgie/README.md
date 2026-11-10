@@ -75,10 +75,11 @@ The bootstrap puts MicroPython and pyelftools in `~/.cache/jiro-wedgie` (`JIRO_W
 
 ## Installing on a wedgie
 
-Download and unzip the `wedgie-check` or `wedgie-app` artifact of a CI run (or build it, above), and from its folder, with wedgie's CLI ([wedgie.dev/wedgie.py](https://wedgie.dev/wedgie.py)):
+Download and unzip the `wedgie-check` or `wedgie-app` artifact of a CI run (or build it, above), and give its folder to wedgie's CLI ([wedgie.dev/wedgie.py](https://wedgie.dev/wedgie.py)), which is in neither the artifact nor this repository, and needs pyserial:
 
 ```bash
-python3 wedgie.py install .
+curl -O https://wedgie.dev/wedgie.py
+python3 wedgie.py install <the unzipped folder, or wedgie/app, or wedgie/check>
 ```
 
 Press green on the wedgie to accept. The check app then shows its progress and results; the Training app its level select. Both are `mod` `jiro`, so installing one replaces the other. Don't run `python3 wedgie.py debug` while the check runs: it stops the app and restarts it. Run it afterwards, to read `error.log` if the app ended on an error.
