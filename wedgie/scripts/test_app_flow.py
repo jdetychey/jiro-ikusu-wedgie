@@ -37,15 +37,24 @@ class Done(Exception):
 
 
 class Clock:
-    """MicroPython's time: ticks that wrap at 2^30, and a sleep that only moves the clock."""
+    """MicroPython's time: ticks that wrap at 2^30, and a sleep that only moves the clock.
+    `stall_in_sleep` is the µs that the next sleep takes on top of its own: the clock of a wedgie
+    that stalled while the app waited for a tick."""
 
     PERIOD = 1 << 30
+    SPIN_READINGS = 10_000  # the app reads the clock in a loop for its last 2 ms before a tick: 100 readings here
 
     def __init__(self):
         self.us = 123_456_789
+        self.stall_in_sleep = 0
+        self.readings = 0  # since the last sleep
 
     def ticks_us(self):
         self.us += 20  # a call takes time, so a loop that waits for the clock ends
+        self.readings += 1
+        if self.readings > self.SPIN_READINGS:
+            raise AssertionError(f"the app has read the clock {self.readings} times in a row: it waits for a time "
+                                 "that does not come")
         return self.us % self.PERIOD
 
     def ticks_ms(self):
@@ -58,7 +67,8 @@ class Clock:
         return (end - start + self.PERIOD // 2) % self.PERIOD - self.PERIOD // 2
 
     def sleep_ms(self, ms):
-        self.us += ms * 1000
+        self.us += ms * 1000 + self.stall_in_sleep
+        self.stall_in_sleep = self.readings = 0
 
 
 class Wedgie:
@@ -66,13 +76,14 @@ class Wedgie:
     buffers. `outcomes` scripts the levels played, in order: (ticks, end reason, claim in basis
     points, lives left); `presses` the keys pressed on the screens outside play, in order, each a
     second after its screen. The run ends with Done once they are all made. `stalls` gives the
-    ticks whose step takes that many µs, `changed` the pixel rectangle of the cells that every
-    paint finds changed."""
+    ticks whose step takes that many µs, `wait_stalls` the ticks after which the wait for the next
+    tick does, and `changed` the pixel rectangle of the cells that every paint finds changed."""
 
-    def __init__(self, outcomes=(), presses=(), bests=None, store_errors=(), status=None, stalls=None, changed=None):
+    def __init__(self, outcomes=(), presses=(), bests=None, store_errors=(), status=None, stalls=None,
+                 wait_stalls=None, changed=None):
         self.outcomes, self.presses, self.store_errors = list(outcomes), list(presses), list(store_errors)
         self.bests = {} if bests is None else bests
-        self.entities, self.stalls, self.stepped_at = status or {}, stalls or {}, []
+        self.entities, self.stalls, self.wait_stalls, self.stepped_at = status or {}, stalls or {}, wait_stalls or {}, []
         self.changed, self.drawing = changed, []  # the fills and pushes, in order, a list per render
         self.clock = Clock()
         self.pages, self.colors, self.overlays, self.stores, self.stages, self.pushes = [], [], [], [], [], []
@@ -195,6 +206,7 @@ class Wedgie:
         ticks, end, _, _ = self.playing[1]
         self.stepped_at.append(self.clock.us)
         self.clock.us += self.stalls.get(self.playing[2], 0)
+        self.clock.stall_in_sleep = self.wait_stalls.get(self.playing[2], 0)
         self.playing[2] += 1
         if self.playing[2] < ticks:
             return 0
@@ -344,9 +356,10 @@ class Flow(unittest.TestCase):
                 fractional[name] = shown
         self.assertEqual(fractional, {"Ring": "target 76.50 %", "Titan": "target 81.50 %"})
 
-    def test_one_life_is_not_1_lives(self):
-        wedgie = self.play(outcomes=[(9, COMMITTED, 1234, 1)], presses=["A", "A"])
-        self.assertEqual(wedgie.pages[1][1][2], "1 life, 9 ticks")
+    def test_one_life_is_not_1_lives_nor_one_tick_1_ticks(self):
+        wedgie = self.play(outcomes=[(9, COMMITTED, 1234, 1), (1, COMMITTED, 0, 5)], presses=["A", "A", "A", "A"])
+        self.assertEqual([lines[2] for head, lines, _ in wedgie.pages if head == "Committed"],
+                         ["1 life, 9 ticks", "5 lives, 1 tick"])
 
     def test_the_stages_of_the_heap_are_measured(self):
         wedgie = self.play(outcomes=[(3, COMMITTED, 0, 5)], presses=["A", "A"])
@@ -367,8 +380,10 @@ class Flow(unittest.TestCase):
                             MINIONS + 8: 59 - y}
                 with self.subTest(player=(x, y)):
                     wedgie = self.play(outcomes=[(3, COMMITTED, 0, 5)], presses=["A", "A"], status=entities)
-                    # Each render pushes the boss, the two live minions and the player.
-                    self.assertEqual(len([push for push in wedgie.pushes if push[2:] != (240, 240)]) % 4, 0)
+                    # The two redraws of a level start and its three ticks each push the boss, the two
+                    # live minions and the player; the redraws and the overlay push the whole screen.
+                    whole = [push for push in wedgie.pushes if push == (0, 0, 240, 240)]
+                    self.assertEqual((len(wedgie.pushes) - len(whole), len(whole)), (5 * 4, 3))
 
     def test_a_tick_draws_everything_before_it_pushes_anything(self):
         # Changed cells 16 pixels wide go out as their rectangle, 128 wide as their rows at full width.
@@ -464,9 +479,25 @@ class Ticks(unittest.TestCase):
         self.assertEqual(self.app.wait_until(due), due)
         self.assertTrue(0 <= self.clock.ticks_diff(self.clock.ticks_us(), due) < self.NEAR_US)
 
-    def level(self, ticks, stalls=None):
+    def test_wait_until_goes_on_when_the_clock_jumped_while_it_slept(self):
+        # The app spends most of a tick in this sleep, where the firmware gets its turn. The last four
+        # are past ticks_diff's range of 2^29 µs, where a due time that passed reads as still ahead.
+        late = (5_000_000, 400_000_000, (1 << 29) + 5, 600_000_000, 900_000_000, (1 << 30) - 5_000_000)
+        for stall in (30_000,) + late:
+            with self.subTest(stall=stall):
+                due = self.clock.ticks_add(self.clock.ticks_us(), 60_000)
+                self.clock.stall_in_sleep = stall
+                before = self.clock.us
+                returned = self.app.wait_until(due)
+                self.assertLess(self.clock.us - before - stall, 60_000 + self.NEAR_US, "it waited on after the stall")
+                if stall in late:  # the schedule starts again from now
+                    self.assertTrue(0 <= self.clock.ticks_diff(self.clock.ticks_us(), returned) < self.NEAR_US)
+                else:  # 28 ms late: the tick keeps its due time
+                    self.assertEqual(returned, due)
+
+    def level(self, ticks, stalls=None, wait_stalls=None):
         """The µs between the steps of a level of `ticks` ticks, and its overruns as printed."""
-        wedgie = Wedgie(outcomes=[(ticks, COMMITTED, 0, 5)], presses=["A", "A"], stalls=stalls)
+        wedgie = Wedgie(outcomes=[(ticks, COMMITTED, 0, 5)], presses=["A", "A"], stalls=stalls, wait_stalls=wait_stalls)
         self.addCleanup(wedgie.close)
         printed = wedgie.run()
         steps = wedgie.stepped_at
@@ -495,6 +526,23 @@ class Ticks(unittest.TestCase):
                 self.assertAlmostEqual(gaps[10], stall, delta=self.NEAR_US)  # the next tick runs at once
                 for gap in gaps[:10] + gaps[11:]:  # and every other tick takes its fifteenth of a second
                     self.assertAlmostEqual(gap, self.TICK_US, delta=self.NEAR_US)
+
+    def test_a_stall_inside_the_wait_for_a_tick_is_not_made_up_for_either(self):
+        for stall in (150_000, 5_000_000, 600_000_000, 900_000_000, (1 << 30) - 5_000_000):
+            with self.subTest(stall=stall):
+                gaps, overruns = self.level(31, wait_stalls={10: stall})
+                self.assertEqual(overruns, 0, "no tick ended late: the level stalled between two")
+                # The tick runs as the sleep ends, 2 ms before its due time.
+                self.assertAlmostEqual(gaps[10], self.TICK_US + stall, delta=2_500)
+                for gap in gaps[:10] + gaps[11:]:
+                    self.assertAlmostEqual(gap, self.TICK_US, delta=self.NEAR_US)
+
+    def test_a_short_stall_inside_the_wait_is_made_up_for_by_the_next_tick(self):
+        gaps, overruns = self.level(31, wait_stalls={10: 30_000})
+        self.assertEqual(overruns, 0)
+        self.assertGreater(gaps[10], self.TICK_US + 25_000)
+        self.assertAlmostEqual(gaps[10] + gaps[11], 2 * self.TICK_US, delta=self.NEAR_US)
+        self.assertAlmostEqual(sum(gaps), 30 * self.TICK_US, delta=self.NEAR_US)
 
 
 if __name__ == "__main__":

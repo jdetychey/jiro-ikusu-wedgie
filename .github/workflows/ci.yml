@@ -5,10 +5,11 @@
 # the app's tick; the app's flow on the host; its play test on qemu, its journals checked against
 # native replay, with the heap filled down to the 137,760 bytes a wedgie has free, plain and with a
 # hard IRQ at every tick, then to the 113,568 a power-up with the WEDGIE drive leaves, then with the
-# screen checked against a full redraw after every tick; and that the app files committed in
-# wedgie/app/ are what this commit builds. The MicroPython clone, its pyelftools venv and its
-# mpy-cross and qemu builds live in ~/.cache/jiro-wedgie, cached on MicroPython's commit and the
-# qemu build script. qemu runs under a timeout, because a module that hard-faults hangs it.
+# screen checked against a full redraw after every tick, then with what a tick takes from the heap
+# counted; and that the app files committed in wedgie/app/ are what this commit builds. The
+# MicroPython clone, its pyelftools venv and its mpy-cross and qemu builds live in
+# ~/.cache/jiro-wedgie, cached on MicroPython's commit and the qemu build script. qemu runs under a
+# timeout, because a module that hard-faults hangs it.
 name: ci
 
 on:
@@ -103,6 +104,11 @@ jobs:
         run: |
           timeout 600 python3 -I wedgie/scripts/qemu_app_check.py "${{ steps.micropython.outputs.firmware }}" \
             wedgie/app 100000 --screen
+
+      - name: The play test with what a tick takes from the heap counted, in place of the lock
+        run: |
+          timeout 600 python3 -I wedgie/scripts/qemu_app_check.py "${{ steps.micropython.outputs.firmware }}" \
+            wedgie/app 137760 --allocations
 
       - name: The committed app files are this commit's build
         run: bash scripts/check-drift.sh wedgie/app

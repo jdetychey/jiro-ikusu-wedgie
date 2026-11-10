@@ -153,15 +153,17 @@ def wait_until(due):
     the level does not run the ticks it is behind by one after the other (a wedgie that slept on
     its battery in the middle of a level would otherwise play the rest of it at once). A due
     time is never more than one tick ahead, so one that ticks_diff reads further ahead is more
-    than 2^29 µs late, past its range: that tick is late too, and never slept for."""
-    left = time.ticks_diff(due, time.ticks_us())
-    if left > _TICK_US + 1 or left < -_TICK_US:
-        return time.ticks_us()
-    if left > 2000:
-        time.sleep_ms(left // 1000 - 1)  # the firmware answers USB in here
-    while time.ticks_diff(due, time.ticks_us()) > 0:
-        pass
-    return due
+    than 2^29 µs late, past its range: that tick is late too. The clock is read again each time
+    round, after the sleep too: the app spends most of a tick in that sleep, so that is where a
+    stall is likeliest to leave it, and a due time misread after it must not be waited for."""
+    while True:
+        left = time.ticks_diff(due, time.ticks_us())
+        if left > _TICK_US + 1 or left < -_TICK_US:
+            return time.ticks_us()
+        if left <= 0:
+            return due
+        if left > 2000:
+            time.sleep_ms(left // 1000 - 1)  # the firmware answers USB in here
 
 
 def percent(bp):
@@ -169,8 +171,9 @@ def percent(bp):
     return "%d.%02d %%" % (bp // 100, bp % 100)
 
 
-def lives(count):
-    return "1 life" if count == 1 else "%d lives" % count
+def counted(count, one, many):
+    """A count with its noun: 1 life, 3 lives."""
+    return "%d %s" % (count, one if count == 1 else many)
 
 
 def store(bests):
@@ -187,18 +190,18 @@ def store(bests):
 class Training:
     """The 16 levels from the level select to each level's summary, in the buffers jiro.py made.
     From its start on it allocates nothing sizable: a level start reads into the level buffer, a
-    tick allocates nothing on the heap but its drawing's frame, and a screen's strings are small."""
+    tick allocates nothing on the heap but its drawing's frame (the play test counts it, with
+    --allocations), and a screen's strings are small."""
 
     def __init__(self, stack_slot, recorder, shadow, level, level_file, bests, heap):
         self.stack_slot, self.recorder, self.shadow = stack_slot, recorder, shadow
         self.level, self.level_file, self.bests = level, level_file, bests
         self.heap = heap
+        self.stack_bytes = len(stack_slot[0])  # read here, so that lending the stack never touches it
         self.unsaved = None  # while a store has failed and the save lacks a best: that store's errno
         self.screen, self.keys = lcd.LCD(), lcd.Keys()
         heap("lcd")
         self.frame = self.screen.buffer
-        # The screen's calls of a tick, bound once: a call through the screen would bind one each time.
-        self.show_rect, self.fill_rect, self.show_band = self.screen.show_rect, self.screen.fill_rect, self.screen.show
         # What the core reports after the last render and after the one before, where the entities
         # still stand on the screen; and the rectangle of the cells a paint changed.
         self.status, self.previous = array("H", [0] * _STATUS_LEN), array("H", [0] * _STATUS_LEN)
@@ -292,7 +295,7 @@ class Training:
         s.fill_rect(24, 80, 192, 80, ui.WHITE)
         s.center_text(self.levels[index][0], 92, ui.INK, 2)
         s.center_text("target " + (percent(target) if target % 100 else "%d %%" % (target // 100)), 122, ui.MUTED, 1)
-        s.center_text(lives(status[_LIVES]), 138, ui.MUTED, 1)
+        s.center_text(counted(status[_LIVES], "life", "lives"), 138, ui.MUTED, 1)
         s.show()
         time.sleep_ms(_OVERLAY_MS)
 
@@ -343,12 +346,13 @@ class Training:
         is drawn, so the screen never shows a capture's cells without the entities on them. One
         call with few locals, since a call whose frame is over 11 words takes it from the heap, a
         first-fit search that a fragmented heap makes slow, and slower the larger the frame
-        (wedgie/scripts/check_app_frames.py)."""
+        (wedgie/scripts/check_app_frames.py). The screen's methods are called on the screen: one
+        kept bound and called with fill_rect's five arguments would take the array of its
+        arguments from the heap at every call."""
         # The array of the render before last takes this tick's status.
         status, previous = self.previous, self.status
         self.status, self.previous = status, previous
-        recorder, frame = self.recorder, self.frame  # a tuple of 4 or more would be built on the heap
-        fill, show = self.fill_rect, self.show_rect
+        recorder, frame, screen = self.recorder, self.frame, self.screen  # a fourth would build a tuple on the heap
         jc.status(recorder, status)
         # The grid's cells again where the entities stood: the boss, the live minions, and the
         # player with the cells its ring reached into.
@@ -360,33 +364,36 @@ class Training:
         # The cells that changed since the last render; their rectangle goes to self.rect.
         jc.paint(recorder, self.shadow, frame, CELL_COLORS, self.rect)
         # The entities where they are now, the player on top.
-        fill(status[_BOSS_X] * _CELL_PX, status[_BOSS_Y] * _CELL_PX, status[_BOSS_SIZE] * _CELL_PX, status[_BOSS_SIZE] * _CELL_PX, BOSS)
+        screen.fill_rect(status[_BOSS_X] * _CELL_PX, status[_BOSS_Y] * _CELL_PX,
+                         status[_BOSS_SIZE] * _CELL_PX, status[_BOSS_SIZE] * _CELL_PX, BOSS)
         for slot in range(_MINIONS, _STATUS_LEN, _MINION_FIELDS):
             if status[slot] == _LIVE:
-                fill(status[slot + 1] * _CELL_PX, status[slot + 2] * _CELL_PX, _CELL_PX, _CELL_PX, MINION)
+                screen.fill_rect(status[slot + 1] * _CELL_PX, status[slot + 2] * _CELL_PX, _CELL_PX, _CELL_PX, MINION)
         x, y = status[_PLAYER_X] * _CELL_PX, status[_PLAYER_Y] * _CELL_PX  # fill_rect clips the ring to the screen
-        fill(x - _PLAYER_MARGIN_PX, y - _PLAYER_MARGIN_PX, _RING_PX, _RING_PX, PLAYER_RING)
-        fill(x - 1, y - 1, _RING_PX - 2, _RING_PX - 2, PLAYER_PROTECTED if status[_INVULNERABLE] else PLAYER)
+        screen.fill_rect(x - _PLAYER_MARGIN_PX, y - _PLAYER_MARGIN_PX, _RING_PX, _RING_PX, PLAYER_RING)
+        screen.fill_rect(x - 1, y - 1, _RING_PX - 2, _RING_PX - 2, PLAYER_PROTECTED if status[_INVULNERABLE] else PLAYER)
         # The changed cells' rectangle, if any cell changed: its rows at full width when it is wide.
         if self.rect[2] >= _BAND_MIN_PX:
-            self.show_band(self.rect[1], self.rect[1] + self.rect[3])
+            screen.show(self.rect[1], self.rect[1] + self.rect[3])
         elif self.rect[2]:
-            show(self.rect[0], self.rect[1], self.rect[2], self.rect[3])
+            screen.show_rect(self.rect[0], self.rect[1], self.rect[2], self.rect[3])
         # One push per entity: the rectangle that holds where it stood and where it is.
         x, y = min(previous[_BOSS_X], status[_BOSS_X]), min(previous[_BOSS_Y], status[_BOSS_Y])
-        show(x * _CELL_PX, y * _CELL_PX, (max(previous[_BOSS_X], status[_BOSS_X]) + status[_BOSS_SIZE] - x) * _CELL_PX,
-             (max(previous[_BOSS_Y], status[_BOSS_Y]) + status[_BOSS_SIZE] - y) * _CELL_PX)
+        screen.show_rect(x * _CELL_PX, y * _CELL_PX,
+                         (max(previous[_BOSS_X], status[_BOSS_X]) + status[_BOSS_SIZE] - x) * _CELL_PX,
+                         (max(previous[_BOSS_Y], status[_BOSS_Y]) + status[_BOSS_SIZE] - y) * _CELL_PX)
         for slot in range(_MINIONS, _STATUS_LEN, _MINION_FIELDS):
             if previous[slot] == _LIVE or status[slot] == _LIVE:
                 old = previous if previous[slot] == _LIVE else status
                 new = status if status[slot] == _LIVE else previous
                 x, y = min(old[slot + 1], new[slot + 1]), min(old[slot + 2], new[slot + 2])
-                show(x * _CELL_PX, y * _CELL_PX, (max(old[slot + 1], new[slot + 1]) + 1 - x) * _CELL_PX,
-                     (max(old[slot + 2], new[slot + 2]) + 1 - y) * _CELL_PX)
+                screen.show_rect(x * _CELL_PX, y * _CELL_PX, (max(old[slot + 1], new[slot + 1]) + 1 - x) * _CELL_PX,
+                                 (max(old[slot + 2], new[slot + 2]) + 1 - y) * _CELL_PX)
         x = max(min(previous[_PLAYER_X], status[_PLAYER_X]) * _CELL_PX - _PLAYER_MARGIN_PX, 0)
         y = max(min(previous[_PLAYER_Y], status[_PLAYER_Y]) * _CELL_PX - _PLAYER_MARGIN_PX, 0)
-        show(x, y, min(max(previous[_PLAYER_X], status[_PLAYER_X]) * _CELL_PX + _CELL_PX + _PLAYER_MARGIN_PX, _FIELD_PX) - x,
-             min(max(previous[_PLAYER_Y], status[_PLAYER_Y]) * _CELL_PX + _CELL_PX + _PLAYER_MARGIN_PX, _FIELD_PX) - y)
+        screen.show_rect(
+            x, y, min(max(previous[_PLAYER_X], status[_PLAYER_X]) * _CELL_PX + _CELL_PX + _PLAYER_MARGIN_PX, _FIELD_PX) - x,
+            min(max(previous[_PLAYER_Y], status[_PLAYER_Y]) * _CELL_PX + _CELL_PX + _PLAYER_MARGIN_PX, _FIELD_PX) - y)
 
     # Its end.
 
@@ -401,7 +408,7 @@ class Training:
         score = jc.score(self.recorder, weight)
         lines = [("claim " + percent(status[_CLAIM]), ui.INK),
                  ("score %d, %s" % (score, self.keep_best(index, score)), ui.INK),
-                 ("%s, %d ticks" % (lives(status[_LIVES]), status[_TICKS]), ui.MUTED)]
+                 (counted(status[_LIVES], "life", "lives") + ", " + counted(status[_TICKS], "tick", "ticks"), ui.MUTED)]
         if self.unsaved is not None:
             lines.append(("best not saved: " + ("flash full" if self.unsaved == 0 else "errno %d" % self.unsaved), ui.RED))
         ui.page(self.screen, END_TITLES[end], lines, "{g} next")
@@ -456,15 +463,13 @@ class Training:
         text, which the heap may hold in no other block by now. Nothing allocated in between
         stays alive, so the block is whole again for the stack: a failed store leaves only its
         errno."""
-        slot = self.stack_slot
-        size = len(slot[0])
-        slot[0] = None
+        self.stack_slot[0] = None
         gc.collect()
         try:
             return store(self.bests)
         finally:
             gc.collect()
             try:
-                slot[0] = bytearray(size)
+                self.stack_slot[0] = bytearray(self.stack_bytes)
             except MemoryError:
                 raise RuntimeError("the core's stack could not be taken back after storing the bests")
