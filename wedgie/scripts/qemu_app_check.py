@@ -195,11 +195,11 @@ def _step(recorder, mask, stack):
     return _inner['step'](recorder, mask, stack)
   finally:
     micropython.heap_unlock()
-def _render(app, status, previous):
+def _render(app):
   _locked[2] += 1
   micropython.heap_lock()
   try:
-    return _inner['render'](app, status, previous)
+    return _inner['render'](app)
   finally:
     micropython.heap_unlock()
 def _lock_ticks():
@@ -330,8 +330,8 @@ def show_rect(x, y, w, h):
     raise ValueError('show_rect splits a byte of two pixels, which the copy does not model: %r' % ((x, y, w, h),))
   for row in range(y, y + h):
     _copy(PANEL, _BUF, row * 120 + x // 2, w // 2)
-def _render(app, status, previous):
-  _inner['render'](app, status, previous)
+def _render(app):
+  _inner['render'](app)
   if not _redrawing[0]:
     _check(app)
 def _redraw(app):

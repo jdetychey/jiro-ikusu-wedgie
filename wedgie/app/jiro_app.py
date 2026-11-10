@@ -2,6 +2,9 @@
 # precompiled as jiro_app.mpy (wedgie/scripts/build-app.sh). The core is the referee: each tick's
 # inputs go into the README §6.1 mask and through the core's Recorder, and the app only draws
 # what the core reports. wedgie/scripts/qemu_app_check.py plays it on MicroPython's qemu port.
+#
+# The numbers are const(): mpy-cross writes each where it is used, so a name costs the wedgie no
+# RAM and the tick no lookup.
 import gc
 import os
 import struct
@@ -9,33 +12,73 @@ import time
 from array import array
 from binascii import hexlify
 
+from micropython import const
+
 import jiro_core as jc
 import lcd
 import save
 import ui
 
+# The level file, which wedgie/scripts/make_app_levels.py writes: MAGIC, the rules version (u16)
+# and the level count (u8), then per level its name behind a length byte, its weightBp (u16), its
+# level id and its level bytes.
 MAGIC = b"JL01"
-LEVEL_BYTES = 472
-TRAINING = 0
-TRAINING_INDEX = 0  # Training plays at levelIndex 0, as in the browser
+_HEADER_BYTES = const(7)
+_LEVEL_ID_BYTES = const(32)
+_LEVEL_BYTES = const(472)
+
+# The core's calls. A journal's header holds the level id after its version, rules version, mode
+# and run nonce (README §6.3).
+_TRAINING = const(0)
+_TRAINING_INDEX = const(0)  # Training plays at levelIndex 0, as in the browser
+_JOURNAL_LEVEL_ID = const(36)
+_STEP_ERROR = const(0x100)  # step returns an error code above it, an end reason below
+
+# The fields of jc.status (jiro_status in natmod/rust/src/lib.rs), in its order.
+_END = const(0)
+_TICKS = const(1)
+_TIME_LIMIT = const(2)
+_LIVES = const(3)
+_SHIELD = const(4)
+_INVULNERABLE = const(5)
+_CUTTING = const(6)
+_CLAIM = const(7)
+_TARGET = const(8)
+_PLAYER_X = const(9)
+_PLAYER_Y = const(10)
+_BOSS_X = const(11)
+_BOSS_Y = const(12)
+_BOSS_SIZE = const(13)
+_MINIONS = const(14)  # from here, each of the 3 minion slots' state, then its x and y
+_MINION_FIELDS = const(3)
+_STATUS_LEN = const(23)
+_LIVE = const(1)  # a minion slot's state
+
+# The end reasons (README §4.10), which step returns and status reports.
+END_TITLES = ("", "Committed", "Cleared", "Out of lives", "Time up")
+_CLEARED = const(2)
+
 # Tick k is due at t0 + floor(k × 10^6 / 15) µs: 66,666 µs and two thirds, on an absolute schedule.
-TICK_US = 66666
-OVERLAY_MS = 1500
-SUMMARY_GUARD_MS = 500
-# The app collects every GC_EVERY_TICKS ticks, after a tick whose work took under GC_LIGHT_US, so
+_TICK_US = const(66666)
+_OVERLAY_MS = const(1500)
+_SUMMARY_GUARD_MS = const(500)
+_MENU_POLL_MS = const(30)
+# The app collects every _GC_EVERY_TICKS ticks, after a tick whose work took under _GC_LIGHT_US, so
 # that the garbage of a tick's drawing (the frames and lists of the firmware's show_rect) is not
 # collected inside a heavy tick: a collection took up to 27.5 ms in the app on a wedgie, and a
 # light tick and a collection fit in a tick (round E1: no overrun, against three before).
-GC_EVERY_TICKS = 8
-GC_LIGHT_US = 25000
-PRINT_STALL_MS = 100  # a print that takes longer finds the USB port open but not read
-CELL_PX = 4
-FIELD_PX = 240
+_GC_EVERY_TICKS = const(8)
+_GC_LIGHT_US = const(25000)
+_PRINT_STALL_MS = const(100)  # a print that takes longer finds the USB port open but not read
+_JOURNAL_LINE_BYTES = const(48)  # of the journal, in hex, per line printed
 
 # The controls of README §2 (D8) and their bits of the README §6.1 mask. Y and the joystick press
 # are not controls, so they never reach the mask.
 CONTROL_BITS = {"up": 1, "down": 2, "left": 4, "right": 8, "A": 16, "B": 32, "X": 64}
 
+# The screen: 240 × 240 pixels, a cell of the 60 × 60 field on 4 × 4 of them.
+_CELL_PX = const(4)
+_FIELD_PX = const(240)
 # The colors of the cell states EMPTY, CLAIMED, TRAIL and BOSS_ZONE (README §4.1) and of the
 # entities: the browser's (web/src/render.ts), each the nearest of the screen's 16 (lcd.color),
 # but the boss's. Its magenta, #ff3cf0, comes out as the trail's red, so the boss is the palette's
@@ -49,32 +92,22 @@ PLAYER_PROTECTED = lcd.color(0x9A, 0x9A, 0x9A)
 # each side, in a black ring 1 pixel wider, so it stands out on the trail, the claimed area and
 # the borders. The ring reaches into the neighbouring cells, which the next tick restores.
 PLAYER_RING = lcd.color(0, 0, 0)
-PLAYER_MARGIN_PX = 2
-RING_PX = CELL_PX + 2 * PLAYER_MARGIN_PX
-
-# The fields of jc.status (jiro_status in natmod/rust/src/lib.rs), in its order.
-END, TICKS, TIME_LIMIT, LIVES, SHIELD, INVULNERABLE, CUTTING, CLAIM, TARGET = range(9)
-PLAYER_X, PLAYER_Y, BOSS_X, BOSS_Y, BOSS_SIZE = range(9, 14)
-MINIONS = 14  # from here, each of the 3 minion slots' state, then its x and y
-STATUS_LEN = 23
-LIVE = 1
-STEP_ERROR = 0x100
-END_TITLES = ("", "Committed", "Cleared", "Out of lives", "Time up")
-CLEARED = 2
+_PLAYER_MARGIN_PX = const(2)
+_RING_PX = const(_CELL_PX + 2 * _PLAYER_MARGIN_PX)
 # A changed area at least this wide is pushed as full-width rows, the screen's fast path: a row of
 # show_rect costs about 45 µs plus 0.26 µs a pixel, a row of a full-width band about 75 µs, which
 # also allocates nothing per chunk of rows (wedgie.dev/code.md; the firmware's lcd.py).
-BAND_MIN_PX = 128
+_BAND_MIN_PX = const(128)
 
 
-def main(stack, recorder, shadow, level, level_file, bests, heap, stages):
-    """`stack` is a list that holds the core's stack, which Training lends to save.store."""
-    if jc.recorder_size() > len(recorder) or jc.shadow_size() > len(shadow) or len(level) != LEVEL_BYTES:
-        raise ValueError("jiro_core needs a %d B Recorder, a %d B shadow and a %d B level buffer" % (
-            jc.recorder_size(), jc.shadow_size(), LEVEL_BYTES))
+def main(stack_slot, recorder, shadow, level, level_file, bests, heap):
+    """Plays Training in jiro.py's buffers. `stack_slot` is a list that holds the core's stack, so
+    that the app can lend the stack's block to save.store; `heap` measures the heap at a stage."""
+    if jc.recorder_size() > len(recorder) or len(level) != _LEVEL_BYTES:
+        raise ValueError("jiro_core needs a %d B Recorder and a %d B level buffer" % (jc.recorder_size(), _LEVEL_BYTES))
     if not isinstance(bests, dict):
         raise ValueError("the bests save is not a dict")
-    Training(stack, recorder, shadow, level, level_file, bests, heap, stages).run()
+    Training(stack_slot, recorder, shadow, level, level_file, bests, heap).run()
 
 
 def read_levels(f):
@@ -86,16 +119,16 @@ def read_levels(f):
     rules_version, count = struct.unpack(">HB", f.read(3))
     if rules_version != jc.rules_version():
         raise ValueError("the levels are scored for rules version %d, the core runs %d" % (rules_version, jc.rules_version()))
-    offset = 7
+    offset = _HEADER_BYTES
     for _ in range(count):
         name_bytes = f.read(1)[0]
         name = f.read(name_bytes).decode()
         weight = struct.unpack(">H", f.read(2))[0]
-        level_id = f.read(32)
-        offset += 1 + name_bytes + 2 + 32
+        level_id = f.read(_LEVEL_ID_BYTES)
+        offset += 1 + name_bytes + 2 + _LEVEL_ID_BYTES
         levels.append((name, weight, level_id, offset))
-        f.seek(LEVEL_BYTES, 1)
-        offset += LEVEL_BYTES
+        f.seek(_LEVEL_BYTES, 1)
+        offset += _LEVEL_BYTES
     return levels
 
 
@@ -116,7 +149,7 @@ def left_until(due):
     """The µs left until `due`, or -1 once it has passed. A due time is never more than one tick
     ahead, so one further ahead is more than 2^29 µs late, past ticks_diff's range: it has passed."""
     left = time.ticks_diff(due, time.ticks_us())
-    return left if left <= TICK_US + 1 else -1
+    return left if left <= _TICK_US + 1 else -1
 
 
 def wait_until(due):
@@ -139,16 +172,22 @@ def store(bests):
 
 
 class Training:
-    def __init__(self, stack, recorder, shadow, level, level_file, bests, heap, stages):
-        self.stack_holder, self.stack, self.stack_bytes = stack, stack[0], len(stack[0])
-        self.recorder, self.shadow, self.level, self.level_file, self.bests = recorder, shadow, level, level_file, bests
-        self.heap, self.stages = heap, stages
+    """The 16 levels from the level select to each level's summary, in the buffers jiro.py made.
+    From its start on it allocates nothing sizable: a level start reads into the level buffer, a
+    tick allocates nothing on the heap but its drawing's frame, and a screen's strings are small."""
+
+    def __init__(self, stack_slot, recorder, shadow, level, level_file, bests, heap):
+        self.stack_slot, self.recorder, self.shadow = stack_slot, recorder, shadow
+        self.level, self.level_file, self.bests = level, level_file, bests
+        self.heap = heap
         self.screen, self.keys = lcd.LCD(), lcd.Keys()
-        heap(stages, "lcd")
+        heap("lcd")
         self.frame = self.screen.buffer
-        self.show_rect, self.fill_rect = self.screen.show_rect, self.screen.fill_rect  # bound once, not per tick
-        self.show_band = self.screen.show
-        self.status, self.previous = array("H", [0] * STATUS_LEN), array("H", [0] * STATUS_LEN)
+        # The screen's calls of a tick, bound once: a call through the screen would bind one each time.
+        self.show_rect, self.fill_rect, self.show_band = self.screen.show_rect, self.screen.fill_rect, self.screen.show
+        # What the core reports after the last render and after the one before, where the entities
+        # still stand on the screen; and the rectangle of the cells a paint changed.
+        self.status, self.previous = array("H", [0] * _STATUS_LEN), array("H", [0] * _STATUS_LEN)
         self.rect = array("H", [0] * 4)
         self.levels = read_levels(level_file)
         # Room in the bests for a key per level, made while the heap has room: a new best then
@@ -158,29 +197,24 @@ class Training:
             bests[key] = 0
         for key in range(len(self.levels)):
             del bests[key]
-        heap(stages, "app")
+        heap("app")
 
-    def best_key(self, index):
-        """As the browser's Training page keys bests: the rules version, the level id and the
-        weight, so a new calibration or rules version starts every level afresh."""
-        _, weight, level_id, _ = self.levels[index]
-        return "%d/0x%s/%d" % (jc.rules_version(), hexlify(level_id).decode(), weight)
+    # The screens around a level.
 
     def run(self):
         index = 0
         while True:
             index = self.choose(index)
-            end = self.play(index)
-            if end == CLEARED and index + 1 < len(self.levels):
+            if self.play(index) == _CLEARED:
                 index += 1
-            elif end == CLEARED:
-                self.congrats()
-                index = 0
+                if index == len(self.levels):
+                    self.congrats()
+                    index = 0
 
     def choose(self, index):
         """The level select, outside play and never journaled: the joystick picks, green plays."""
         count = len(self.levels)
-        self.heap(self.stages, "sel")
+        self.heap("sel")
         while True:
             best = self.bests.get(self.best_key(index))
             ui.page(self.screen, "Level %d of %d" % (index + 1, count),
@@ -193,41 +227,27 @@ class Training:
                 if "A" in pressed:
                     return index
                 step = ("right" in pressed or "down" in pressed) - ("left" in pressed or "up" in pressed)
-                time.sleep_ms(30)
+                time.sleep_ms(_MENU_POLL_MS)
             index = (index + step) % count
 
-    def start(self, index):
-        name, _, level_id, offset = self.levels[index]
-        self.level_file.seek(offset)
-        if self.level_file.readinto(self.level) != LEVEL_BYTES:
-            raise ValueError("the level file ends inside level %s" % name)
-        # Not the firmware's wedgie.rand: its first call probes the I2C bus for a secure element and
-        # keeps the drivers it imports, about 13 KB of a wedgie's heap (round E1).
-        code = jc.start(self.recorder, self.level, TRAINING, os.urandom(32), TRAINING_INDEX, self.stack)
-        if code:
-            raise RuntimeError("the core rejects level %s: code %d" % (name, code))
-        if jc.journal(self.recorder, 36, 68) != level_id:
-            raise ValueError("level %s is not the calibration's" % name)
+    def congrats(self):
+        """After the last level's clear, instead of its level select again: the game is won."""
+        ui.page(self.screen, "Congrats!", [("visit jiro-ikusu.win", ui.INK)], "{g} level 1")
+        self.wait_for_green()
 
-    def redraw(self):
-        """Paints every cell and the entities, and pushes the whole screen."""
-        jc.paint(self.recorder, self.shadow, self.frame, CELL_COLORS, self.rect, True)
-        self.render(self.status, self.status)
-        self.screen.show()
+    def wait_for_green(self):
+        """Presses made before a screen's first 0.5 s do not skip it."""
+        time.sleep_ms(_SUMMARY_GUARD_MS)
+        self.keys.pressed()
+        while "A" not in self.keys.pressed():
+            time.sleep_ms(_MENU_POLL_MS)
 
-    def overlay(self, index):
-        """The brief overlay at level start, before tick 0: the level, its target and the lives."""
-        s, status = self.screen, self.status
-        s.fill_rect(24, 80, 192, 80, ui.WHITE)
-        s.center_text(self.levels[index][0], 92, ui.INK, 2)
-        s.center_text("target %d %%" % (status[TARGET] // 100), 122, ui.MUTED, 1)
-        s.center_text("%d lives" % status[LIVES], 138, ui.MUTED, 1)
-        s.show()
-        time.sleep_ms(OVERLAY_MS)
+    # A level.
 
     def play(self, index):
+        """Plays the level from its start to the green press on its summary; returns how it ended."""
         self.start(index)
-        self.heap(self.stages, "lvl")
+        self.heap("lvl")
         self.redraw()
         self.overlay(index)
         self.redraw()
@@ -237,144 +257,189 @@ class Training:
         self.finish(index, end, timing)
         return end
 
+    def start(self, index):
+        """Reads the level into its buffer and starts it in the core, under a fresh run nonce."""
+        name, _, level_id, offset = self.levels[index]
+        self.level_file.seek(offset)
+        if self.level_file.readinto(self.level) != _LEVEL_BYTES:
+            raise ValueError("the level file ends inside level %s" % name)
+        # Not the firmware's wedgie.rand: its first call probes the I2C bus for a secure element and
+        # keeps the drivers it imports, about 13 KB of a wedgie's heap (round E1).
+        code = jc.start(self.recorder, self.level, _TRAINING, os.urandom(32), _TRAINING_INDEX, self.stack_slot[0])
+        if code:
+            raise RuntimeError("the core rejects level %s: code %d" % (name, code))
+        if jc.journal(self.recorder, _JOURNAL_LEVEL_ID, _JOURNAL_LEVEL_ID + _LEVEL_ID_BYTES) != level_id:
+            raise ValueError("level %s is not the calibration's" % name)
+
+    def overlay(self, index):
+        """The brief overlay at level start, before tick 0: the level, its target and the lives."""
+        s, status = self.screen, self.status
+        s.fill_rect(24, 80, 192, 80, ui.WHITE)
+        s.center_text(self.levels[index][0], 92, ui.INK, 2)
+        s.center_text("target %d %%" % (status[_TARGET] // 100), 122, ui.MUTED, 1)
+        s.center_text("%d lives" % status[_LIVES], 138, ui.MUTED, 1)
+        s.show()
+        time.sleep_ms(_OVERLAY_MS)
+
     def ticks(self):
         """Steps the level once per tick until it ends, on an absolute schedule: a late tick is
-        late, never skipped or stepped twice. Times the step and the drawing separately."""
-        recorder, stack, keys, step = self.recorder, self.stack, self.keys, jc.step
-        status, previous = self.status, self.previous
-        step_max = render_max = tick_max = overruns = 0
+        late, never skipped or stepped twice. Times the step and the drawing separately. Returns
+        the end reason and (the worst step, the worst drawing and the worst tick, in µs, and the
+        overruns: the ticks that ended after the next was due)."""
+        recorder, stack, keys, step = self.recorder, self.stack_slot[0], self.keys, jc.step
+        step_max = render_max = tick_max = overruns = tick = 0
         due = time.ticks_us()
-        tick = 0
         while True:
             wait_until(due)
             started = time.ticks_us()
             end = step(recorder, sample(keys), stack)
             stepped = time.ticks_us()
-            status, previous = previous, status
-            self.render(status, previous)
+            self.render()
             done = time.ticks_us()
             # Tick k + 1 is due floor((k + 1) × 10^6 / 15) - floor(k × 10^6 / 15) µs after tick k:
             # 66,666, 66,667, 66,667, repeating. A running due time keeps ticks_add's delta small.
-            due = time.ticks_add(due, TICK_US + (1 if tick % 3 else 0))
+            due = time.ticks_add(due, _TICK_US + (1 if tick % 3 else 0))
             tick += 1
             step_max = max(step_max, time.ticks_diff(stepped, started))
             render_max = max(render_max, time.ticks_diff(done, stepped))
             tick_max = max(tick_max, time.ticks_diff(done, started))
             if left_until(due) < 0:
                 overruns += 1
-            if tick % GC_EVERY_TICKS == 0 and time.ticks_diff(done, started) < GC_LIGHT_US:
+            if tick % _GC_EVERY_TICKS == 0 and time.ticks_diff(done, started) < _GC_LIGHT_US:
                 gc.collect()
-            if end >= STEP_ERROR:
-                raise RuntimeError("jiro-core error %d on tick %d" % (end - STEP_ERROR, tick - 1))
+            if end >= _STEP_ERROR:
+                raise RuntimeError("jiro-core error %d on tick %d" % (end - _STEP_ERROR, tick - 1))
             if end:
-                self.status, self.previous = status, previous
                 return end, (step_max, render_max, tick_max, overruns)
 
-    def render(self, status, previous):
+    # Its drawing.
+
+    def redraw(self):
+        """Paints every cell and the entities, and pushes the whole screen."""
+        jc.status(self.recorder, self.status)  # where the entities are, for render to erase them there
+        jc.paint(self.recorder, self.shadow, self.frame, CELL_COLORS, self.rect, True)
+        self.render()
+        self.screen.show()
+
+    def render(self):
         """Erases the entities where they stood, paints the cells that changed, draws the
         entities, and pushes only the regions that changed: the cells each entity left and
         entered, the player's with its ring. One call with few locals, since a call whose frame
         is over 11 words takes it from the heap, a first-fit search that a fragmented heap makes
-        slow, and slower the larger the frame."""
+        slow, and slower the larger the frame (wedgie/scripts/check_app_frames.py)."""
+        # The array of the render before last takes this tick's status.
+        status, previous = self.previous, self.status
+        self.status, self.previous = status, previous
         recorder, frame = self.recorder, self.frame  # a tuple of 4 or more would be built on the heap
         fill, show = self.fill_rect, self.show_rect
         jc.status(recorder, status)
-        jc.restore(recorder, frame, CELL_COLORS, previous[BOSS_X], previous[BOSS_Y], previous[BOSS_SIZE], previous[BOSS_SIZE])
-        for slot in range(MINIONS, STATUS_LEN, 3):
-            if previous[slot] == LIVE:
+        # The grid's cells again where the entities stood: the boss, the live minions, and the
+        # player with the cells its ring reached into.
+        jc.restore(recorder, frame, CELL_COLORS, previous[_BOSS_X], previous[_BOSS_Y], previous[_BOSS_SIZE], previous[_BOSS_SIZE])
+        for slot in range(_MINIONS, _STATUS_LEN, _MINION_FIELDS):
+            if previous[slot] == _LIVE:
                 jc.restore(recorder, frame, CELL_COLORS, previous[slot + 1], previous[slot + 2], 1, 1)
-        jc.restore(recorder, frame, CELL_COLORS, max(previous[PLAYER_X] - 1, 0), max(previous[PLAYER_Y] - 1, 0), 3, 3)
+        jc.restore(recorder, frame, CELL_COLORS, max(previous[_PLAYER_X] - 1, 0), max(previous[_PLAYER_Y] - 1, 0), 3, 3)
+        # The cells that changed since the last render, pushed as one rectangle or band of rows.
         if jc.paint(recorder, self.shadow, frame, CELL_COLORS, self.rect):
-            if self.rect[2] >= BAND_MIN_PX:
+            if self.rect[2] >= _BAND_MIN_PX:
                 self.show_band(self.rect[1], self.rect[1] + self.rect[3])
             else:
                 show(self.rect[0], self.rect[1], self.rect[2], self.rect[3])
-        fill(status[BOSS_X] * CELL_PX, status[BOSS_Y] * CELL_PX, status[BOSS_SIZE] * CELL_PX, status[BOSS_SIZE] * CELL_PX, BOSS)
-        for slot in range(MINIONS, STATUS_LEN, 3):
-            if status[slot] == LIVE:
-                fill(status[slot + 1] * CELL_PX, status[slot + 2] * CELL_PX, CELL_PX, CELL_PX, MINION)
-        x, y = status[PLAYER_X] * CELL_PX, status[PLAYER_Y] * CELL_PX  # fill_rect clips the ring to the screen
-        fill(x - PLAYER_MARGIN_PX, y - PLAYER_MARGIN_PX, RING_PX, RING_PX, PLAYER_RING)
-        fill(x - 1, y - 1, RING_PX - 2, RING_PX - 2, PLAYER_PROTECTED if status[INVULNERABLE] else PLAYER)
-        x, y = min(previous[BOSS_X], status[BOSS_X]), min(previous[BOSS_Y], status[BOSS_Y])
-        show(x * CELL_PX, y * CELL_PX, (max(previous[BOSS_X], status[BOSS_X]) + status[BOSS_SIZE] - x) * CELL_PX,
-             (max(previous[BOSS_Y], status[BOSS_Y]) + status[BOSS_SIZE] - y) * CELL_PX)
-        for slot in range(MINIONS, STATUS_LEN, 3):
-            if previous[slot] == LIVE or status[slot] == LIVE:
-                old = previous if previous[slot] == LIVE else status
-                new = status if status[slot] == LIVE else previous
+        # The entities where they are now, the player on top.
+        fill(status[_BOSS_X] * _CELL_PX, status[_BOSS_Y] * _CELL_PX, status[_BOSS_SIZE] * _CELL_PX, status[_BOSS_SIZE] * _CELL_PX, BOSS)
+        for slot in range(_MINIONS, _STATUS_LEN, _MINION_FIELDS):
+            if status[slot] == _LIVE:
+                fill(status[slot + 1] * _CELL_PX, status[slot + 2] * _CELL_PX, _CELL_PX, _CELL_PX, MINION)
+        x, y = status[_PLAYER_X] * _CELL_PX, status[_PLAYER_Y] * _CELL_PX  # fill_rect clips the ring to the screen
+        fill(x - _PLAYER_MARGIN_PX, y - _PLAYER_MARGIN_PX, _RING_PX, _RING_PX, PLAYER_RING)
+        fill(x - 1, y - 1, _RING_PX - 2, _RING_PX - 2, PLAYER_PROTECTED if status[_INVULNERABLE] else PLAYER)
+        # One push per entity: the rectangle that holds where it stood and where it is.
+        x, y = min(previous[_BOSS_X], status[_BOSS_X]), min(previous[_BOSS_Y], status[_BOSS_Y])
+        show(x * _CELL_PX, y * _CELL_PX, (max(previous[_BOSS_X], status[_BOSS_X]) + status[_BOSS_SIZE] - x) * _CELL_PX,
+             (max(previous[_BOSS_Y], status[_BOSS_Y]) + status[_BOSS_SIZE] - y) * _CELL_PX)
+        for slot in range(_MINIONS, _STATUS_LEN, _MINION_FIELDS):
+            if previous[slot] == _LIVE or status[slot] == _LIVE:
+                old = previous if previous[slot] == _LIVE else status
+                new = status if status[slot] == _LIVE else previous
                 x, y = min(old[slot + 1], new[slot + 1]), min(old[slot + 2], new[slot + 2])
-                show(x * CELL_PX, y * CELL_PX, (max(old[slot + 1], new[slot + 1]) + 1 - x) * CELL_PX,
-                     (max(old[slot + 2], new[slot + 2]) + 1 - y) * CELL_PX)
-        x = max(min(previous[PLAYER_X], status[PLAYER_X]) * CELL_PX - PLAYER_MARGIN_PX, 0)
-        y = max(min(previous[PLAYER_Y], status[PLAYER_Y]) * CELL_PX - PLAYER_MARGIN_PX, 0)
-        show(x, y, min(max(previous[PLAYER_X], status[PLAYER_X]) * CELL_PX + CELL_PX + PLAYER_MARGIN_PX, FIELD_PX) - x,
-             min(max(previous[PLAYER_Y], status[PLAYER_Y]) * CELL_PX + CELL_PX + PLAYER_MARGIN_PX, FIELD_PX) - y)
+                show(x * _CELL_PX, y * _CELL_PX, (max(old[slot + 1], new[slot + 1]) + 1 - x) * _CELL_PX,
+                     (max(old[slot + 2], new[slot + 2]) + 1 - y) * _CELL_PX)
+        x = max(min(previous[_PLAYER_X], status[_PLAYER_X]) * _CELL_PX - _PLAYER_MARGIN_PX, 0)
+        y = max(min(previous[_PLAYER_Y], status[_PLAYER_Y]) * _CELL_PX - _PLAYER_MARGIN_PX, 0)
+        show(x, y, min(max(previous[_PLAYER_X], status[_PLAYER_X]) * _CELL_PX + _CELL_PX + _PLAYER_MARGIN_PX, _FIELD_PX) - x,
+             min(max(previous[_PLAYER_Y], status[_PLAYER_Y]) * _CELL_PX + _CELL_PX + _PLAYER_MARGIN_PX, _FIELD_PX) - y)
+
+    # Its end.
 
     def finish(self, index, end, timing):
         """The between-level screen: the claim, the score and the lives, and the best; the
         timing goes to USB only. The score is the core's, with the calibration's weight. The
         screen comes before the USB output, since a print blocks for about 500 ms when a host
-        holds the port open without reading it; for that host, the journal's lines stop at the
-        first print that takes longer than PRINT_STALL_MS."""
+        holds the port open without reading it."""
         name, weight, _, _ = self.levels[index]
-        status, recorder = self.status, self.recorder
-        score = jc.score(recorder, weight)
-        claim = "%d.%02d %%" % (status[CLAIM] // 100, status[CLAIM] % 100)
-        key = self.best_key(index)
-        best = self.bests.get(key)
-        if best is None or score > best:
-            self.bests[key] = score
-            best_line = self.store_bests()
-        else:
-            best_line = "best %d" % best
+        status = self.status
+        score = jc.score(self.recorder, weight)
         ui.page(self.screen, END_TITLES[end],
-                [("claim " + claim, ui.INK),
-                 ("score %d, %s" % (score, best_line), ui.INK),
-                 ("%d lives, %d ticks" % (status[LIVES], status[TICKS]), ui.MUTED)], "{g} next")
+                [("claim %d.%02d %%" % (status[_CLAIM] // 100, status[_CLAIM] % 100), ui.INK),
+                 ("score %d, %s" % (score, self.keep_best(index, score)), ui.INK),
+                 ("%d lives, %d ticks" % (status[_LIVES], status[_TICKS]), ui.MUTED)], "{g} next")
         print("jiro: level %d %s end %d claim_bp %d ticks %d lives %d score %d" % (
-            index + 1, name, end, status[CLAIM], status[TICKS], status[LIVES], score))
+            index + 1, name, end, status[_CLAIM], status[_TICKS], status[_LIVES], score))
         print("jiro: step max %d us, render max %d us, worst tick %d us, overruns %d" % timing)
+        self.print_journal()
+        self.wait_for_green()
+
+    def print_journal(self):
+        """The level's journal over USB, in hex, which `jiro-tools replay` replays. For a host that
+        holds the port open without reading it, the lines stop at the first print that takes
+        longer than _PRINT_STALL_MS."""
         start = 0
         while True:
-            chunk = jc.journal(recorder, start, start + 48)
+            chunk = jc.journal(self.recorder, start, start + _JOURNAL_LINE_BYTES)
             if not chunk:
                 break
             printed = time.ticks_ms()
             print("jiro: journal", hexlify(chunk).decode())
-            if time.ticks_diff(time.ticks_ms(), printed) > PRINT_STALL_MS:
+            if time.ticks_diff(time.ticks_ms(), printed) > _PRINT_STALL_MS:
                 break
-            start += 48
-        self.wait_for_green()
+            start += _JOURNAL_LINE_BYTES
 
-    def congrats(self):
-        """After the last level's clear, instead of its level select again: the game is won."""
-        ui.page(self.screen, "Congrats!", [("visit jiro-ikusu.win", ui.INK)], "{g} level 1")
-        self.wait_for_green()
+    # The bests.
 
-    def wait_for_green(self):
-        """Presses made before a screen's first 0.5 s do not skip it."""
-        time.sleep_ms(SUMMARY_GUARD_MS)
-        self.keys.pressed()
-        while "A" not in self.keys.pressed():
-            time.sleep_ms(30)
+    def best_key(self, index):
+        """As the browser's Training page keys bests: the rules version, the level id and the
+        weight, so a new calibration or rules version starts every level afresh."""
+        _, weight, level_id, _ = self.levels[index]
+        return "%d/0x%s/%d" % (jc.rules_version(), hexlify(level_id).decode(), weight)
 
-    def store_bests(self):
-        """Stores the bests in the core's stack's block, idle between levels, then takes the stack
-        back, and returns the summary's line: save.store opens a 1,148-byte file and writes the
-        bests' text, which the heap may hold in no other block by now. Nothing allocated in
-        between stays alive, so the block is whole again for the stack: a failed store leaves
-        only its errno."""
-        self.stack = self.stack_holder[0] = None
-        gc.collect()
-        try:
-            errno = store(self.bests)
-        finally:
-            gc.collect()
-            try:
-                self.stack = self.stack_holder[0] = bytearray(self.stack_bytes)
-            except MemoryError:
-                raise RuntimeError("the core's stack could not be taken back after storing the bests")
+    def keep_best(self, index, score):
+        """Keeps and stores `score` if it is the level's best; returns the summary's words for it."""
+        key = self.best_key(index)
+        best = self.bests.get(key)
+        if best is not None and score <= best:
+            return "best %d" % best
+        self.bests[key] = score
+        errno = self.store_bests()
         if errno is None:
             return "a new best"
         return "best not saved: " + ("flash full" if errno == 0 else "errno %d" % errno)
+
+    def store_bests(self):
+        """Stores the bests in the core's stack's block, idle between levels, then takes the stack
+        back; returns `store`'s result. save.store opens a 1,148-byte file and writes the bests'
+        text, which the heap may hold in no other block by now. Nothing allocated in between
+        stays alive, so the block is whole again for the stack: a failed store leaves only its
+        errno."""
+        slot = self.stack_slot
+        size = len(slot[0])
+        slot[0] = None
+        gc.collect()
+        try:
+            return store(self.bests)
+        finally:
+            gc.collect()
+            try:
+                slot[0] = bytearray(size)
+            except MemoryError:
+                raise RuntimeError("the core's stack could not be taken back after storing the bests")

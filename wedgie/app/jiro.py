@@ -12,14 +12,13 @@ import gc
 
 STACK_BYTES = 24576  # start needs up to 19 KB of stack; the rp2 C stack is 8 KB
 RECORDER_BYTES = 18568  # jiro_core.recorder_size(), which jiro_app checks
-SHADOW_BYTES = 3600  # jiro_core.shadow_size(), which jiro_app checks
 LEVEL_BYTES = 472  # a level's bytes in the level file, which jiro_app checks
 LEVELS = "jiro_levels.bin"
 
 
-def heap(stages, stage):
+def heap(stage):
     """Measures the free heap and the largest bytearray it can hold, to 16 bytes, after a
-    collection; prints them and records them in `stages` under `stage`."""
+    collection; prints them for `stage` and returns them."""
     gc.collect()
     free = gc.mem_free()
     low, high = 0, free
@@ -33,24 +32,23 @@ def heap(stages, stage):
             del block
             low = size
     gc.collect()
-    stages[stage] = (free, low)
     print("jiro: heap %s: free %d B, largest block %d B" % (stage, free, low))
+    return free, low
 
 
 def run():
-    stages = {}
-    heap(stages, "run")
-    stack, recorder = [bytearray(STACK_BYTES)], bytearray(RECORDER_BYTES)
-    heap(stages, "buf")
+    at_start = heap("run")
+    stack_slot, recorder = [bytearray(STACK_BYTES)], bytearray(RECORDER_BYTES)
+    with_buffers = heap("buf")
     try:
         import jiro_core  # its 18 KB of code next, then jiro_app's objects fill the holes it leaves
     except MemoryError as error:
         raise MemoryError("%s; heap free/largest at start %d/%d, after the stack and Recorder %d/%d" % (
-            (error,) + stages["run"] + stages["buf"]))
+            (error,) + at_start + with_buffers))
     level_file = open(LEVELS, "rb")  # in the hole of the file jiro_core was read through
-    shadow, level = bytearray(SHADOW_BYTES), bytearray(LEVEL_BYTES)
+    shadow, level = bytearray(jiro_core.shadow_size()), bytearray(LEVEL_BYTES)
     import save
     bests = save.load("bests", {})
     import jiro_app
-    heap(stages, "imp")
-    jiro_app.main(stack, recorder, shadow, level, level_file, bests, heap, stages)
+    heap("imp")
+    jiro_app.main(stack_slot, recorder, shadow, level, level_file, bests, heap)
