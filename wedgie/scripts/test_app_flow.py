@@ -65,12 +65,13 @@ class Wedgie:
     """A wedgie as the app sees it: the screen, the keys, the saves, and the core in the app's
     buffers. `outcomes` scripts the levels played, in order: (ticks, end reason, claim in basis
     points, lives left); `presses` the keys pressed on the screens outside play, in order, each a
-    second after its screen. The run ends with Done once they are all made."""
+    second after its screen. The run ends with Done once they are all made. `stalls` gives the
+    ticks whose step takes that many µs."""
 
-    def __init__(self, outcomes=(), presses=(), bests=None, store_errors=(), status=None):
+    def __init__(self, outcomes=(), presses=(), bests=None, store_errors=(), status=None, stalls=None):
         self.outcomes, self.presses, self.store_errors = list(outcomes), list(presses), list(store_errors)
         self.bests = {} if bests is None else bests
-        self.entities = status or {}
+        self.entities, self.stalls, self.stepped_at = status or {}, stalls or {}, []
         self.clock = Clock()
         self.pages, self.colors, self.overlays, self.stores, self.stages, self.pushes = [], [], [], [], [], []
         self.playing = None  # the level in play: its bytes, its outcome and the ticks stepped
@@ -188,6 +189,8 @@ class Wedgie:
 
     def step(self, recorder, mask, stack):
         ticks, end, _, _ = self.playing[1]
+        self.stepped_at.append(self.clock.us)
+        self.clock.us += self.stalls.get(self.playing[2], 0)
         self.playing[2] += 1
         if self.playing[2] < ticks:
             return 0
@@ -384,33 +387,79 @@ class Flow(unittest.TestCase):
 
 
 class Ticks(unittest.TestCase):
-    """The tick's clock: wait_until waits for a due time, and a tick is never early."""
+    """The tick's clock: 15 ticks a second, a late tick made up for by the next, and a tick more
+    than one tick late not made up for at all."""
+
+    TICK_US = 1_000_000 / 15
+    NEAR_US = 400  # the stand-in clock moves 20 µs a reading
 
     def setUp(self):
         self.wedgie = Wedgie()
         self.addCleanup(self.wedgie.close)
         self.app, self.clock = self.wedgie.app, self.wedgie.clock
 
-    def test_wait_until_returns_at_the_due_time(self):
+    def test_wait_until_returns_the_due_time_at_the_due_time(self):
         for ahead in (0, 1, 1999, 2001, 66666, 66667):
             with self.subTest(ahead=ahead):
                 due = self.clock.ticks_add(self.clock.ticks_us(), ahead)
-                self.app.wait_until(due)
-                self.assertTrue(0 <= self.clock.ticks_diff(self.clock.ticks_us(), due) < 200)
+                self.assertEqual(self.app.wait_until(due), due)
+                self.assertTrue(0 <= self.clock.ticks_diff(self.clock.ticks_us(), due) < self.NEAR_US)
 
-    def test_wait_until_does_not_wait_for_a_due_time_that_passed(self):
-        for late in (1, 66666, 10_000_000, (1 << 29) + 5, 600_000_000):
+    def test_wait_until_runs_a_tick_up_to_one_tick_late_at_once_on_its_due_time(self):
+        for late in (1, 30_000, 66_600):  # the stand-in clock moves on while wait_until reads it
             with self.subTest(late=late):
                 due = self.clock.ticks_add(self.clock.ticks_us(), -late)
                 before = self.clock.us
-                self.app.wait_until(due)
-                self.assertLess(self.clock.us - before, 200)
+                self.assertEqual(self.app.wait_until(due), due)
+                self.assertLess(self.clock.us - before, self.NEAR_US)
+
+    def test_wait_until_starts_the_schedule_again_from_a_tick_later_than_that(self):
+        # The last two are past ticks_diff's range of 2^29 µs, where a late due time reads as ahead.
+        for late in (66_800, 10_000_000, (1 << 29) - 5, (1 << 29) + 5, 600_000_000):
+            with self.subTest(late=late):
+                due = self.clock.ticks_add(self.clock.ticks_us(), -late)
+                before = self.clock.us
+                now = self.app.wait_until(due)
+                self.assertLess(self.clock.us - before, self.NEAR_US)
+                self.assertTrue(0 <= self.clock.ticks_diff(self.clock.ticks_us(), now) < self.NEAR_US)
 
     def test_wait_until_waits_across_the_clocks_wrap(self):
         self.clock.us = Clock.PERIOD - 30_000
         due = self.clock.ticks_add(self.clock.ticks_us(), 60_000)
-        self.app.wait_until(due)
-        self.assertTrue(0 <= self.clock.ticks_diff(self.clock.ticks_us(), due) < 200)
+        self.assertEqual(self.app.wait_until(due), due)
+        self.assertTrue(0 <= self.clock.ticks_diff(self.clock.ticks_us(), due) < self.NEAR_US)
+
+    def level(self, ticks, stalls=None):
+        """The µs between the steps of a level of `ticks` ticks, and its overruns as printed."""
+        wedgie = Wedgie(outcomes=[(ticks, COMMITTED, 0, 5)], presses=["A", "A"], stalls=stalls)
+        self.addCleanup(wedgie.close)
+        printed = wedgie.run()
+        steps = wedgie.stepped_at
+        self.assertEqual(len(steps), ticks)
+        return [later - sooner for sooner, later in zip(steps, steps[1:])], int(printed.split("overruns ")[1].split()[0])
+
+    def test_a_level_runs_at_15_ticks_a_second(self):
+        gaps, overruns = self.level(91)
+        self.assertEqual(overruns, 0)
+        self.assertAlmostEqual(sum(gaps), 90 * self.TICK_US, delta=self.NEAR_US)
+        for gap in gaps:
+            self.assertAlmostEqual(gap, self.TICK_US, delta=self.NEAR_US)
+
+    def test_the_tick_after_a_late_one_comes_sooner_and_the_schedule_holds(self):
+        gaps, overruns = self.level(31, stalls={10: 100_000})
+        self.assertEqual(overruns, 1)
+        self.assertAlmostEqual(gaps[10], 100_000, delta=self.NEAR_US)  # the next tick runs at once
+        self.assertAlmostEqual(gaps[11], 2 * self.TICK_US - 100_000, delta=self.NEAR_US)
+        self.assertAlmostEqual(sum(gaps), 30 * self.TICK_US, delta=self.NEAR_US)
+
+    def test_a_stall_of_more_than_a_tick_is_not_made_up_for(self):
+        for stall in (150_000, 5_000_000, 600_000_000):
+            with self.subTest(stall=stall):
+                gaps, overruns = self.level(31, stalls={10: stall})
+                self.assertEqual(overruns, 1)
+                self.assertAlmostEqual(gaps[10], stall, delta=self.NEAR_US)  # the next tick runs at once
+                for gap in gaps[:10] + gaps[11:]:  # and every other tick takes its fifteenth of a second
+                    self.assertAlmostEqual(gap, self.TICK_US, delta=self.NEAR_US)
 
 
 if __name__ == "__main__":

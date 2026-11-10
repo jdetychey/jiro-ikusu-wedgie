@@ -58,7 +58,8 @@ _LIVE = const(1)  # a minion slot's state
 END_TITLES = ("", "Committed", "Cleared", "Out of lives", "Time up")
 _CLEARED = const(2)
 
-# Tick k is due at t0 + floor(k × 10^6 / 15) µs: 66,666 µs and two thirds, on an absolute schedule.
+# Tick k is due at t0 + floor(k × 10^6 / 15) µs: 66,666 µs and two thirds, on an absolute schedule,
+# which starts again from a tick that is more than one tick late (wait_until).
 _TICK_US = const(66666)
 _OVERLAY_MS = const(1500)
 _SUMMARY_GUARD_MS = const(500)
@@ -145,19 +146,22 @@ def sample(keys):
     return mask
 
 
-def left_until(due):
-    """The µs left until `due`, or -1 once it has passed. A due time is never more than one tick
-    ahead, so one further ahead is more than 2^29 µs late, past ticks_diff's range: it has passed."""
-    left = time.ticks_diff(due, time.ticks_us())
-    return left if left <= _TICK_US + 1 else -1
-
-
 def wait_until(due):
-    left = left_until(due)
+    """Waits for a tick's due time and returns it. A tick up to one tick late runs at once and
+    keeps its due time, so the next comes sooner and the level keeps its 15 ticks a second. A
+    tick later than that returns now as its due time: the schedule starts again from it, and
+    the level does not run the ticks it is behind by one after the other (a wedgie that slept on
+    its battery in the middle of a level would otherwise play the rest of it at once). A due
+    time is never more than one tick ahead, so one that ticks_diff reads further ahead is more
+    than 2^29 µs late, past its range: that tick is late too, and never slept for."""
+    left = time.ticks_diff(due, time.ticks_us())
+    if left > _TICK_US + 1 or left < -_TICK_US:
+        return time.ticks_us()
     if left > 2000:
         time.sleep_ms(left // 1000 - 1)  # the firmware answers USB in here
-    while left_until(due) > 0:
+    while time.ticks_diff(due, time.ticks_us()) > 0:
         pass
+    return due
 
 
 def percent(bp):
@@ -293,7 +297,7 @@ class Training:
         time.sleep_ms(_OVERLAY_MS)
 
     def ticks(self):
-        """Steps the level once per tick until it ends, on an absolute schedule: a late tick is
+        """Steps the level once per tick until it ends, on wait_until's schedule: a late tick is
         late, never skipped or stepped twice. Times the step and the drawing separately. Returns
         the end reason and (the worst step, the worst drawing and the worst tick, in µs, and the
         overruns: the ticks that ended after the next was due)."""
@@ -301,7 +305,7 @@ class Training:
         step_max = render_max = tick_max = overruns = tick = 0
         due = time.ticks_us()
         while True:
-            wait_until(due)
+            due = wait_until(due)
             started = time.ticks_us()
             end = step(recorder, sample(keys), stack)
             stepped = time.ticks_us()
@@ -314,7 +318,7 @@ class Training:
             step_max = max(step_max, time.ticks_diff(stepped, started))
             render_max = max(render_max, time.ticks_diff(done, stepped))
             tick_max = max(tick_max, time.ticks_diff(done, started))
-            if left_until(due) < 0:
+            if not 0 <= time.ticks_diff(due, done) <= _TICK_US + 1:  # past, or past ticks_diff's range
                 overruns += 1
             if tick % _GC_EVERY_TICKS == 0 and time.ticks_diff(done, started) < _GC_LIGHT_US:
                 gc.collect()

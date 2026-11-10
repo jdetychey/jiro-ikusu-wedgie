@@ -20,8 +20,9 @@ bests' text and a file object: the app must take its stack back, say on the summ
 is not saved, and play on. The second play of level 1 scores no new best, and its end must store
 the one the first left unsaved; level 2's then stores both. The app's clock is a stub over the port's: its ticks_us
 wraps 2^30 µs shortly after each level's tick 0, and on tick LATE_TICK it jumps LATE_US ahead,
-more than ticks_diff's 2^29 µs range, as a wedgie whose ticks fell that far behind would see it:
-the remaining ticks must run at once, late, instead of sleeping for minutes. Then it checks:
+more than ticks_diff's 2^29 µs range, as a wedgie that stalled that long would see it: the app
+must neither sleep for minutes nor run the ticks it is behind by one after the other, but go on
+from there at 15 ticks a second. Then it checks:
 
 - per level, the journal the app printed: its header (Training, the stub's run nonce, the level's
   id from seasons/calibration-1.json, levelIndex 0) and its events, which must be the changes of
@@ -29,8 +30,9 @@ the remaining ticks must run at once, late, instead of sleeping for minutes. The
 - per level, the app's end reason, claim, ticks and score against native replay of that journal
   (`jiro-tools replay` with the level's weight), and that it captured something;
 - the best scores it stored and when, the free heap and largest free block it printed at each
-  stage, a summary screen per level, the first alone saying its best was not saved, and no overrun
-  before the clock's jump and one on every tick from it on;
+  stage, a summary screen per level, the first alone saying its best was not saved;
+- per level, one overrun, the tick of the clock's jump, and one tick that began early, the next,
+  which runs at once: no other tick began less than EARLY_US after the tick before it;
 - that the heap was locked over every tick's sample, step and render;
 - that the ballast left the free bytes asked for.
 
@@ -104,6 +106,7 @@ STAGES = ("run", "buf", "imp", "lcd", "app", "sel", "lvl")
 WRAP_AFTER_US = 1_500_000  # from the last press outside play, just before tick 0, to the clock's wrap: about tick 22
 LATE_TICK = 70
 LATE_US = 600_000_000
+EARLY_US = 60_000  # a tick that begins sooner than this after the tick before it is early: a tick is 66,667 µs
 
 # README §6.1 bits of the wedgie's key names (D8); Y and press are not controls.
 BITS = {"up": 1, "down": 2, "left": 4, "right": 8, "A": 16, "B": 32, "X": 64}
@@ -169,6 +172,7 @@ class LCD(framebuf.FrameBuffer):
 class ScriptDone(Exception):
   pass
 _menu, _script, _tick, _play, _wrap, _level, _held = MENU, SCRIPT, [0], [False], [0], [0], [None] * 64
+_began, _early = [0], [0]
 def _largest():
   gc.collect()
   low, high = 0, gc.mem_free()
@@ -229,7 +233,7 @@ class Keys:
       _level[0] += 1
       if _level[0] == PLAY_COUNT:
         raise ScriptDone('scripted inputs done; most rows pushed in a tick: %d; heap locked over %d samples, %d steps '
-                         'and %d renders' % (_rows[1], _locked[0], _locked[1], _locked[2])
+                         'and %d renders; %d ticks began early' % (_rows[1], _locked[0], _locked[1], _locked[2], _early[0])
                          + (screen.result() if SCREEN else ''))
       _play[0], _tick[0] = False, 0
     if not _play[0]:
@@ -240,10 +244,13 @@ class Keys:
       return _menu.pop(0) if _menu else []
     if _tick[0] == 0:
       _wrap[0] = clock.ticks_us()
+    elif clock.ticks_diff(clock.ticks_us(), _began[0]) < EARLY_US:
+      _early[0] += 1
     if _tick[0] == LATE_TICK:
       if clock.ticks_us() >= _wrap[0]:
         raise ValueError('the clock did not wrap between tick 0 and tick %d' % LATE_TICK)
       clock.jump(LATE_US)
+    _began[0] = clock.ticks_us()
     if _tick[0]:
       _rows[1] = max(_rows[1], _rows[0])  # what the previous tick pushed
     _rows[0] = 0
@@ -541,9 +548,9 @@ def check_level(repo, calibration, level, output, stored):
     if stored.get(key) != score:
         problems.append(f"stored bests {stored}, expected {key}: {score}")
     step_us, render_us, tick_us, overruns = map(int, re.findall(r"\d+", timing))
-    if overruns != ticks - LATE_TICK:
-        problems.append(f"{overruns} overruns, expected {ticks - LATE_TICK}: none before the clock's jump on tick "
-                        f"{LATE_TICK}, then every tick")
+    if overruns != (ticks > LATE_TICK):
+        problems.append(f"{overruns} overruns, expected {int(ticks > LATE_TICK)}: the tick of the clock's jump, tick "
+                        f"{LATE_TICK}, and no other")
     print(f"level {level} ({level_path.name}): end {end}, claim {claim} bp, ticks {ticks}, score {score}"
           + ("; native replay agrees" if not problems else ""))
     for name, us in (("step", step_us), ("render", render_us), ("tick", tick_us)):
@@ -636,6 +643,11 @@ def check(out, err, repo, irq_counts, screen):
     ticks = sum(fields(line, "ticks")[0] for line, _, _ in outputs)
     if not locked or not int(locked[1]) == int(locked[2]) == ticks <= int(locked[3]):
         problems.append(f"the heap was locked over {locked and locked[0]}, expected every one of the {ticks} ticks")
+    early = re.search(r"(\d+) ticks began early", err)
+    jumps = sum(fields(line, "ticks")[0] > LATE_TICK + 1 for line, _, _ in outputs)
+    if not early or int(early[1]) != jumps:
+        problems.append(f"{early[1] if early else 'an unread number of'} ticks began less than {EARLY_US} us after the "
+                        f"tick before, expected {jumps}: on each level, the tick after the clock's jump alone")
     if screen:
         problems += check_screen(err, ticks)
     scores = [fields(line, "score")[0] for line, _, _ in outputs]
@@ -654,7 +666,7 @@ def main(firmware, app, free_bytes, holes, hard_irq, screen):
     stubs = dict(STUBS)
     script = [(held, tapped) for ticks, held, tapped in SCRIPT for _ in range(ticks)]
     stubs["lcd.py"] = (f"SQUEEZE_BYTES = {SQUEEZE_BYTES}\nWRAP_AFTER_US = {WRAP_AFTER_US}\nLATE_TICK = {LATE_TICK}\n"
-                       f"LATE_US = {LATE_US}\nPLAY_COUNT = {len(PLAYS)}\nMENU = {menu_presses()!r}\nSCRIPT = {script!r}\n"
+                       f"LATE_US = {LATE_US}\nEARLY_US = {EARLY_US}\nPLAY_COUNT = {len(PLAYS)}\nMENU = {menu_presses()!r}\nSCRIPT = {script!r}\n"
                        f"SCREEN = {screen}\n") + stubs["lcd.py"]
     if screen:
         stubs["screen.py"] = "from __main__ import _PANEL as PANEL\n" + SCREEN_STUB

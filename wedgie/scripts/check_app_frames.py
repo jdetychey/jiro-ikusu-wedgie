@@ -19,7 +19,7 @@ import sys
 STATE_ON_C_STACK = 44  # bytes: VM_MAX_STATE_ON_STACK on a 32-bit port
 SLOT_BYTES, HANDLER_BYTES, HEADER_BYTES, HEAP_BLOCK = 4, 12, 20, 16  # mp_obj_t, mp_exc_stack_t, mp_code_state_t
 # What Training.ticks calls on every tick, besides jiro_core and the firmware.
-ON_C_STACK = ("sample", "left_until", "wait_until")
+ON_C_STACK = ("sample", "wait_until")
 # The tick's one frame on the heap, and the heap blocks it may take.
 ON_HEAP = {"Training.render": 7}
 
