@@ -160,6 +160,15 @@ def wait_until(due):
         pass
 
 
+def percent(bp):
+    """Basis points as the screens show them, to the hundredth of a percent: 677 is 6.77 %."""
+    return "%d.%02d %%" % (bp // 100, bp % 100)
+
+
+def lives(count):
+    return "1 life" if count == 1 else "%d lives" % count
+
+
 def store(bests):
     """Stores the bests: None, or the errno of the OSError save.store raised, 0 for its "flash
     full", which has none. A call of its own, so that no reference to the exception outlives it:
@@ -275,10 +284,11 @@ class Training:
     def overlay(self, index):
         """The brief overlay at level start, before tick 0: the level, its target and the lives."""
         s, status = self.screen, self.status
+        target = status[_TARGET]  # a whole percentage on most levels, 76.50 % or 81.50 % on two
         s.fill_rect(24, 80, 192, 80, ui.WHITE)
         s.center_text(self.levels[index][0], 92, ui.INK, 2)
-        s.center_text("target %d %%" % (status[_TARGET] // 100), 122, ui.MUTED, 1)
-        s.center_text("%d lives" % status[_LIVES], 138, ui.MUTED, 1)
+        s.center_text("target " + (percent(target) if target % 100 else "%d %%" % (target // 100)), 122, ui.MUTED, 1)
+        s.center_text(lives(status[_LIVES]), 138, ui.MUTED, 1)
         s.show()
         time.sleep_ms(_OVERLAY_MS)
 
@@ -382,9 +392,9 @@ class Training:
         name, weight, _, _ = self.levels[index]
         status = self.status
         score = jc.score(self.recorder, weight)
-        lines = [("claim %d.%02d %%" % (status[_CLAIM] // 100, status[_CLAIM] % 100), ui.INK),
+        lines = [("claim " + percent(status[_CLAIM]), ui.INK),
                  ("score %d, %s" % (score, self.keep_best(index, score)), ui.INK),
-                 ("%d lives, %d ticks" % (status[_LIVES], status[_TICKS]), ui.MUTED)]
+                 ("%s, %d ticks" % (lives(status[_LIVES]), status[_TICKS]), ui.MUTED)]
         if self.unsaved is not None:
             lines.append(("best not saved: " + ("flash full" if self.unsaved == 0 else "errno %d" % self.unsaved), ui.RED))
         ui.page(self.screen, END_TITLES[end], lines, "{g} next")

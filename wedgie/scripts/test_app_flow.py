@@ -319,6 +319,23 @@ class Flow(unittest.TestCase):
         wedgie = self.play(outcomes=[(3, COMMITTED, 0, 5)], presses=["A", "A"])
         self.assertEqual(wedgie.overlays, ["Open", "target 75 %", "5 lives"])
 
+    def test_the_overlay_gives_every_levels_target_to_the_basis_point(self):
+        # Two levels' targets are not whole percentages: Ring's 7,650 and Titan's 8,150 basis points.
+        fractional = {}
+        for level, record in enumerate(level_records(), 1):
+            target, lives = int.from_bytes(record[-2:], "big"), record[-3]
+            wedgie = self.play(outcomes=[(3, COMMITTED, 0, lives)], presses=["right"] * (level - 1) + ["A", "A"])
+            name, shown, shown_lives = wedgie.overlays
+            self.assertEqual(shown_lives, f"{lives} lives")
+            self.assertEqual(float(shown.removeprefix("target ").removesuffix(" %")) * 100, target, name)
+            if target % 100:
+                fractional[name] = shown
+        self.assertEqual(fractional, {"Ring": "target 76.50 %", "Titan": "target 81.50 %"})
+
+    def test_one_life_is_not_1_lives(self):
+        wedgie = self.play(outcomes=[(9, COMMITTED, 1234, 1)], presses=["A", "A"])
+        self.assertEqual(wedgie.pages[1][1][2], "1 life, 9 ticks")
+
     def test_the_stages_of_the_heap_are_measured(self):
         wedgie = self.play(outcomes=[(3, COMMITTED, 0, 5)], presses=["A", "A"])
         self.assertEqual(wedgie.stages, ["lcd", "app", "sel", "lvl", "sel"])
